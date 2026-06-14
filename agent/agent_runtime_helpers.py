@@ -329,6 +329,22 @@ def sanitize_tool_call_arguments(
 
 
 
+def _user_alternation_is_strict(agent) -> bool:
+    """True when the active provider requires strict user/assistant alternation.
+
+    ``anthropic_messages`` (Anthropic Messages API) and ``bedrock_converse``
+    (Bedrock Converse) reject consecutive ``user`` messages, so the pre-call
+    repair must merge them. OpenAI-style ``chat_completions`` tolerates
+    consecutive user turns, so they are left as distinct messages — preserving
+    rapid-fire IM sends (issue #45560) instead of collapsing them into a single
+    blob the model answers only the first half of.
+
+    Unknown / unset ``api_mode`` defaults to strict so existing call paths keep
+    their prior (safe) merging behavior.
+    """
+    return getattr(agent, "api_mode", None) != "chat_completions"
+
+
 def repair_message_sequence(agent, messages: List[Dict]) -> int:
     """Collapse malformed role-alternation left in the live history.
 
@@ -347,8 +363,11 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
     Repairs applied:
       1. Stray ``tool`` messages whose ``tool_call_id`` doesn't match
          any preceding assistant tool_call — dropped.
-      2. Consecutive ``user`` messages — merged with newline separator
-         so no user input is lost.
+      2. Consecutive ``user`` messages — merged with a newline separator
+         so no user input is lost, but ONLY for providers that require
+         strict role alternation (anthropic_messages / bedrock_converse).
+         OpenAI-style chat_completions keeps them as distinct turns so
+         rapid-fire IM sends aren't collapsed into one blob (issue #45560).
 
     Deliberately does NOT rewind orphan ``assistant(tool_calls)+tool``
     pairs that precede a user message — that pattern IS valid when the
@@ -395,32 +414,38 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
                 known_tool_ids = set()
             filtered.append(msg)
 
-    # Pass 2: merge consecutive user messages. Preserves all user input
-    # so nothing the user typed is lost.
-    merged: List[Dict] = []
-    for msg in filtered:
-        if (
-            merged
-            and isinstance(msg, dict)
-            and msg.get("role") == "user"
-            and isinstance(merged[-1], dict)
-            and merged[-1].get("role") == "user"
-        ):
-            prev = merged[-1]
-            prev_content = prev.get("content", "")
-            new_content = msg.get("content", "")
-            # Only merge plain-text content; leave multimodal (list)
-            # content alone — collapsing image/audio blocks risks
-            # mangling the attachment structure.
-            if isinstance(prev_content, str) and isinstance(new_content, str):
-                prev["content"] = (
-                    (prev_content + "\n\n" + new_content)
-                    if prev_content and new_content
-                    else (prev_content or new_content)
-                )
-                repairs += 1
-                continue
-        merged.append(msg)
+    # Pass 2: merge consecutive user messages — but only for providers that
+    # require strict role alternation. OpenAI-style chat_completions tolerates
+    # consecutive user turns, so rapid-fire IM sends stay distinct instead of
+    # collapsing into a single blob the model answers only the first half of
+    # (issue #45560). Preserves all user input either way.
+    if _user_alternation_is_strict(agent):
+        merged: List[Dict] = []
+        for msg in filtered:
+            if (
+                merged
+                and isinstance(msg, dict)
+                and msg.get("role") == "user"
+                and isinstance(merged[-1], dict)
+                and merged[-1].get("role") == "user"
+            ):
+                prev = merged[-1]
+                prev_content = prev.get("content", "")
+                new_content = msg.get("content", "")
+                # Only merge plain-text content; leave multimodal (list)
+                # content alone — collapsing image/audio blocks risks
+                # mangling the attachment structure.
+                if isinstance(prev_content, str) and isinstance(new_content, str):
+                    prev["content"] = (
+                        (prev_content + "\n\n" + new_content)
+                        if prev_content and new_content
+                        else (prev_content or new_content)
+                    )
+                    repairs += 1
+                    continue
+            merged.append(msg)
+    else:
+        merged = filtered
 
     if repairs > 0:
         # Rewrite in place so downstream paths (persistence, return
@@ -793,8 +818,14 @@ def try_recover_primary_transport(
 
 def drop_thinking_only_and_merge_users(
     messages: List[Dict[str, Any]],
+    merge_adjacent_users: bool = True,
 ) -> List[Dict[str, Any]]:
     """Drop thinking-only assistant turns; merge any adjacent user messages left behind.
+
+    ``merge_adjacent_users`` gates only the second pass: strict-alternation
+    providers (anthropic_messages / bedrock_converse) need the merge to avoid
+    400s, while OpenAI-style chat_completions passes ``False`` so distinct user
+    turns left adjacent by the drop survive intact (issue #45560).
 
     Runs on the per-call ``api_messages`` copy only. The stored
     conversation history (``agent.messages``) is never mutated, so the
@@ -818,6 +849,17 @@ def drop_thinking_only_and_merge_users(
     dropped = len(messages) - len(kept)
     if dropped == 0:
         return messages
+
+    # Lenient providers (chat_completions) tolerate consecutive user turns,
+    # so skip the merge and let any users left adjacent by the drop stay
+    # distinct (issue #45560).
+    if not merge_adjacent_users:
+        _ra().logger.debug(
+            "Pre-call sanitizer: dropped %d thinking-only assistant turn(s); "
+            "left adjacent user messages distinct (lenient provider alternation)",
+            dropped,
+        )
+        return kept
 
     # Pass 2: merge any newly-adjacent user messages.
     merged: List[Dict[str, Any]] = []

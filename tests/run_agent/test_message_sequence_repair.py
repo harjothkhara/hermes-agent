@@ -79,6 +79,8 @@ def test_drop_scaffolding_handles_multiple_parallel_tool_results():
 # ── _repair_message_sequence ───────────────────────────────────────────────
 
 def test_repair_merges_consecutive_user_messages():
+    # Bare agent has no api_mode set, which defaults to strict alternation,
+    # so the legacy merge behavior still applies.
     agent = _bare_agent()
     messages = [
         {"role": "user", "content": "first"},
@@ -91,6 +93,61 @@ def test_repair_merges_consecutive_user_messages():
     assert len(messages) == 1
     assert messages[0]["role"] == "user"
     assert messages[0]["content"] == "first\n\nsecond"
+
+
+def test_repair_merges_consecutive_user_messages_for_anthropic():
+    """Strict-alternation providers (anthropic_messages) still merge — sending
+    consecutive user turns to the Anthropic Messages API would 400."""
+    agent = _bare_agent()
+    agent.api_mode = "anthropic_messages"
+    messages = [
+        {"role": "user", "content": "first"},
+        {"role": "user", "content": "second"},
+    ]
+
+    repairs = AIAgent._repair_message_sequence(agent, messages)
+
+    assert repairs == 1
+    assert messages == [{"role": "user", "content": "first\n\nsecond"}]
+
+
+def test_repair_keeps_consecutive_user_messages_for_chat_completions():
+    """OpenAI-style chat_completions tolerates consecutive user turns, so
+    rapid-fire IM sends stay distinct instead of collapsing into one blob
+    (issue #45560)."""
+    agent = _bare_agent()
+    agent.api_mode = "chat_completions"
+    messages = [
+        {"role": "user", "content": "first"},
+        {"role": "user", "content": "second"},
+    ]
+
+    repairs = AIAgent._repair_message_sequence(agent, messages)
+
+    assert repairs == 0
+    assert messages == [
+        {"role": "user", "content": "first"},
+        {"role": "user", "content": "second"},
+    ]
+
+
+def test_repair_still_drops_stray_tool_in_chat_completions():
+    """Lenient mode skips only the user-merge — Pass 1 tool repair still runs."""
+    agent = _bare_agent()
+    agent.api_mode = "chat_completions"
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+        {"role": "tool", "tool_call_id": "orphan", "content": "stray"},
+        {"role": "user", "content": "real"},
+    ]
+
+    repairs = AIAgent._repair_message_sequence(agent, messages)
+
+    assert repairs >= 1
+    assert all(m.get("role") != "tool" for m in messages)
+    # The two user turns straddling the dropped tool stay distinct.
+    assert [m["content"] for m in messages if m["role"] == "user"] == ["hi", "real"]
 
 
 def test_repair_preserves_user_content_when_one_side_empty():

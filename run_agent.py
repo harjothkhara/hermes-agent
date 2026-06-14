@@ -1477,6 +1477,11 @@ class AIAgent:
         from agent.agent_runtime_helpers import repair_message_sequence
         return repair_message_sequence(self, messages)
 
+    def _user_alternation_is_strict(self) -> bool:
+        """Forwarder — see ``agent.agent_runtime_helpers._user_alternation_is_strict``."""
+        from agent.agent_runtime_helpers import _user_alternation_is_strict
+        return _user_alternation_is_strict(self)
+
     def _flush_messages_to_session_db(self, messages: List[Dict], conversation_history: List[Dict] = None):
         """Persist any un-flushed messages to the SQLite session store.
 
@@ -2812,10 +2817,11 @@ class AIAgent:
     @staticmethod
     def _drop_thinking_only_and_merge_users(
         messages: List[Dict[str, Any]],
+        merge_adjacent_users: bool = True,
     ) -> List[Dict[str, Any]]:
         """Forwarder — see ``agent.agent_runtime_helpers.drop_thinking_only_and_merge_users``."""
         from agent.agent_runtime_helpers import drop_thinking_only_and_merge_users
-        return drop_thinking_only_and_merge_users(messages)
+        return drop_thinking_only_and_merge_users(messages, merge_adjacent_users)
 
     @staticmethod
     def _cap_delegate_task_calls(tool_calls: list) -> list:
