@@ -520,6 +520,35 @@ class TestSkillManageDispatcher:
         assert result["success"] is False
         assert "content" in result["error"].lower()
 
+    def test_empty_name_fails_fast(self, tmp_path):
+        """An empty name must fail up front with a terminal, name-focused
+        error for EVERY action — not surface a misleading secondary error
+        (e.g. missing content) that sends a background-review fork into a
+        retry loop. Regression test for the 'skill_manage loops on empty
+        name' bug."""
+        with _skill_dir(tmp_path):
+            for action in ("create", "edit", "patch", "delete", "write_file", "remove_file"):
+                raw = skill_manage(action=action, name="")
+                result = json.loads(raw)
+                assert result["success"] is False, action
+                assert "name is required" in result["error"].lower(), action
+
+    def test_whitespace_name_fails_fast(self, tmp_path):
+        with _skill_dir(tmp_path):
+            raw = skill_manage(action="create", name="   ", content=VALID_SKILL_CONTENT)
+        result = json.loads(raw)
+        assert result["success"] is False
+        assert "name is required" in result["error"].lower()
+
+    def test_empty_name_checked_before_content(self, tmp_path):
+        """For 'create', the empty-name error must win over the missing-content
+        error so the model sees the real problem first."""
+        with _skill_dir(tmp_path):
+            raw = skill_manage(action="create", name="")
+        result = json.loads(raw)
+        assert result["success"] is False
+        assert "name is required" in result["error"].lower()
+
     def test_patch_without_old_string(self, tmp_path):
         with _skill_dir(tmp_path):
             raw = skill_manage(action="patch", name="test")

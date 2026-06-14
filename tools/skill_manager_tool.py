@@ -830,6 +830,22 @@ def skill_manage(
 
     Returns JSON string with results.
     """
+    # Fast-fail on a missing/blank skill name before dispatching. Every action
+    # needs a name, but the per-action handlers only reach _validate_name AFTER
+    # their action-specific checks (e.g. 'create' errors on missing content
+    # first), so an empty name surfaces as a misleading secondary error. A
+    # background-review fork that emits an empty name then "fixes" the wrong
+    # thing, resubmits with the name still empty, and burns its whole iteration
+    # budget — the review gets stuck. Validate once, up front, with a clear
+    # terminal error that tells the model not to retry blindly.
+    if not name or not name.strip():
+        return tool_error(
+            "Skill name is required and must be non-empty. Provide a valid "
+            "skill name (lowercase letters, numbers, hyphens) — do not retry "
+            "with an empty name.",
+            success=False,
+        )
+
     if action == "create":
         if not content:
             return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
