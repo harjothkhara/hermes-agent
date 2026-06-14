@@ -160,6 +160,20 @@ class TestDropThinkingOnlyAndMergeUsers:
         assert out[0]["content"] == "u1\n\nu2"
         assert out[1]["content"] == "real reply"
 
+    def test_lenient_mode_drops_thinking_but_keeps_users_distinct(self):
+        # chat_completions tolerates consecutive user turns, so the drop still
+        # runs but the users left adjacent stay distinct (issue #45560).
+        msgs = [
+            {"role": "user", "content": "help me with X"},
+            {"role": "assistant", "content": "", "reasoning": "let me think"},
+            {"role": "user", "content": "ok continue"},
+        ]
+        out = AIAgent._drop_thinking_only_and_merge_users(
+            msgs, merge_adjacent_users=False
+        )
+        assert [m["role"] for m in out] == ["user", "user"]
+        assert [m["content"] for m in out] == ["help me with X", "ok continue"]
+
     def test_does_not_merge_when_drop_leaves_non_adjacent_users(self):
         # Thinking-only at end of conversation — no trailing user to merge
         msgs = [
