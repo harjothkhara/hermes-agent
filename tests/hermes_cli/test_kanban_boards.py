@@ -126,17 +126,85 @@ class TestPathResolution:
             fresh_home / "kanban" / "boards" / "other" / "logs"
         )
 
-    def test_env_var_db_override_still_wins(self, fresh_home, tmp_path, monkeypatch):
-        """``HERMES_KANBAN_DB`` pins the file regardless of board= arg."""
+    def test_env_var_db_override_wins_without_explicit_board(
+        self, fresh_home, tmp_path, monkeypatch
+    ):
+        """``HERMES_KANBAN_DB`` pins the active file unless board= is explicit."""
         forced = tmp_path / "custom.db"
         monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
         assert kb.kanban_db_path() == forced
-        assert kb.kanban_db_path(board="ignored") == forced
+        assert kb.kanban_db_path(board="default") == fresh_home / "kanban.db"
+        assert kb.kanban_db_path(board="ignored") == (
+            fresh_home / "kanban" / "boards" / "ignored" / "kanban.db"
+        )
 
     def test_env_var_workspaces_override(self, fresh_home, tmp_path, monkeypatch):
         forced = tmp_path / "ws"
         monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(forced))
-        assert kb.workspaces_root(board="any") == forced
+        assert kb.workspaces_root() == forced
+        assert kb.workspaces_root(board="default") == fresh_home / "kanban" / "workspaces"
+        assert kb.workspaces_root(board="any") == (
+            fresh_home / "kanban" / "boards" / "any" / "workspaces"
+        )
+
+    def test_explicit_default_board_beats_stale_named_direct_pins(
+        self, fresh_home, monkeypatch
+    ):
+        kb.create_board("alpha")
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.board_dir("alpha") / "kanban.db"))
+        monkeypatch.setenv(
+            "HERMES_KANBAN_WORKSPACES_ROOT",
+            str(kb.board_dir("alpha") / "workspaces"),
+        )
+
+        assert kb.kanban_db_path(board="default") == fresh_home / "kanban.db"
+        assert kb.workspaces_root(board="default") == (
+            fresh_home / "kanban" / "workspaces"
+        )
+
+    def test_explicit_board_arg_wins_over_scoped_current_board(self, fresh_home):
+        kb.create_board("alpha")
+        kb.create_board("beta")
+
+        with kb.scoped_current_board("alpha"):
+            assert kb.kanban_db_path(board="beta") == (
+                fresh_home / "kanban" / "boards" / "beta" / "kanban.db"
+            )
+            assert kb.workspaces_root(board="beta") == (
+                fresh_home / "kanban" / "boards" / "beta" / "workspaces"
+            )
+            assert kb.kanban_db_path(board="default") == fresh_home / "kanban.db"
+
+    def test_stale_scoped_board_falls_back_instead_of_recreating(self, fresh_home):
+        kb.create_board("beta")
+        kb.set_current_board("beta")
+        kb.remove_board("beta")
+
+        with kb.scoped_current_board("beta"):
+            assert kb.get_current_board() == "default"
+            assert kb.kanban_db_path() == fresh_home / "kanban.db"
+            assert kb.workspaces_root() == fresh_home / "kanban" / "workspaces"
+
+        assert not (fresh_home / "kanban" / "boards" / "beta" / "kanban.db").exists()
+
+    def test_scoped_current_board_exports_runtime_env_to_local_subprocesses(
+        self, fresh_home, monkeypatch
+    ):
+        from tools.environments.local import _make_run_env
+
+        kb.create_board("alpha")
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(fresh_home / "stale.db"))
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(fresh_home / "stale-ws"))
+
+        with kb.scoped_current_board("alpha"):
+            env = _make_run_env({})
+
+        assert env["HERMES_KANBAN_BOARD"] == "alpha"
+        assert env["HERMES_KANBAN_DB"] == str(kb.board_dir("alpha") / "kanban.db")
+        assert env["HERMES_KANBAN_WORKSPACES_ROOT"] == str(
+            kb.board_dir("alpha") / "workspaces"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +496,53 @@ class TestWorkerSpawnEnv:
         assert env["HERMES_KANBAN_DB"] == str(expected_db)
         expected_ws = fresh_home / "kanban" / "boards" / "spawntest" / "workspaces"
         assert env["HERMES_KANBAN_WORKSPACES_ROOT"] == str(expected_ws)
+
+    def test_default_spawn_board_arg_ignores_stale_runtime_pins(
+        self, fresh_home, monkeypatch
+    ):
+        captured = {}
+
+        class FakeProc:
+            pid = 1
+
+        def fake_popen(cmd, *args, **kwargs):
+            captured["env"] = kwargs.get("env", {})
+            return FakeProc()
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        kb.create_board("alpha")
+        kb.create_board("beta")
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.board_dir("alpha") / "kanban.db"))
+        monkeypatch.setenv(
+            "HERMES_KANBAN_WORKSPACES_ROOT",
+            str(kb.board_dir("alpha") / "workspaces"),
+        )
+
+        task = kb.Task(
+            id="t_beta",
+            title="worker test",
+            body=None,
+            assignee="teknium",
+            status="ready",
+            priority=0,
+            created_by="user",
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="scratch",
+            workspace_path=None,
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+        )
+        kb._default_spawn(task, str(fresh_home / "ws"), board="beta")
+
+        env = captured["env"]
+        assert env["HERMES_KANBAN_BOARD"] == "beta"
+        assert env["HERMES_KANBAN_DB"] == str(kb.board_dir("beta") / "kanban.db")
+        assert env["HERMES_KANBAN_WORKSPACES_ROOT"] == str(
+            kb.board_dir("beta") / "workspaces"
+        )
 
     def test_default_board_spawn_keeps_legacy_paths(self, fresh_home, monkeypatch):
         captured = {}

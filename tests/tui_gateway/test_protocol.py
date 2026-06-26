@@ -1280,6 +1280,11 @@ def test_slash_exec_handles_plugin_commands_in_live_gateway(server):
 
     worker = Worker()
     server._sessions[sid] = {"session_key": sid, "agent": None, "slash_worker": worker}
+    server._sessions["other-session"] = {
+        "session_key": "other-session",
+        "agent": None,
+        "slash_worker": Worker(),
+    }
 
     with patch(
         "hermes_cli.plugins.get_plugin_command_handler",
@@ -1357,6 +1362,219 @@ def test_slash_exec_plugin_handler_error_returns_output(server):
     assert "error" not in resp
     assert resp["result"] == {"output": "Plugin command error: handler boom: hello"}
     assert worker.calls == []
+
+
+def test_slash_exec_kanban_switch_mirrors_board_env_to_gateway(
+    server, tmp_path, monkeypatch
+):
+    sid = "test-session"
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+
+    from hermes_cli import kanban_db as kb
+
+    kb.create_board("alpha")
+    kb.create_board("beta")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "beta")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.board_dir("beta") / "kanban.db"))
+    monkeypatch.setenv(
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+        str(kb.board_dir("beta") / "workspaces"),
+    )
+
+    class Worker:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, cmd):
+            self.calls.append(cmd)
+            return "Active board is now 'alpha'."
+
+    worker = Worker()
+    server._sessions[sid] = {"session_key": sid, "agent": None, "slash_worker": worker}
+    server._sessions["other-session"] = {
+        "session_key": "other-session",
+        "agent": None,
+        "slash_worker": Worker(),
+    }
+
+    resp = server.handle_request({
+        "id": "r-kanban-switch",
+        "method": "slash.exec",
+        "params": {"command": "kanban boards switch alpha", "session_id": sid},
+    })
+
+    assert "error" not in resp
+    assert resp["result"] == {"output": "Active board is now 'alpha'."}
+    assert worker.calls == ["kanban boards switch alpha"]
+    assert server._sessions[sid]["kanban_board"] == "alpha"
+    assert "kanban_board" not in server._sessions["other-session"]
+    assert server.os.environ["HERMES_KANBAN_BOARD"] == "beta"
+    assert server.os.environ["HERMES_KANBAN_DB"] == str(kb.board_dir("beta") / "kanban.db")
+
+
+def test_slash_exec_kanban_create_switch_mirrors_argparse_form_to_gateway(
+    server, tmp_path, monkeypatch
+):
+    sid = "test-session"
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "stale.db"))
+
+    class Worker:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, cmd):
+            self.calls.append(cmd)
+            kb.create_board("alpha")
+            return "Board 'alpha' created.\n  Switched to 'alpha'."
+
+    worker = Worker()
+    server._sessions[sid] = {"session_key": sid, "agent": None, "slash_worker": worker}
+
+    resp = server.handle_request({
+        "id": "r-kanban-create-switch",
+        "method": "slash.exec",
+        "params": {"command": "Kanban boards create --switch alpha", "session_id": sid},
+    })
+
+    assert "error" not in resp
+    assert resp["result"] == {
+        "output": "Board 'alpha' created.\n  Switched to 'alpha'."
+    }
+    assert worker.calls == ["Kanban boards create --switch alpha"]
+    assert server._sessions[sid]["kanban_board"] == "alpha"
+    assert server.os.environ["HERMES_KANBAN_BOARD"] == "default"
+    assert server.os.environ["HERMES_KANBAN_DB"] == str(tmp_path / "stale.db")
+
+
+def test_slash_exec_kanban_remove_mirrors_board_env_to_gateway(
+    server, tmp_path, monkeypatch
+):
+    sid = "test-session"
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+
+    from hermes_cli import kanban_db as kb
+
+    kb.create_board("alpha")
+    kb.create_board("beta")
+    kb.set_current_board("alpha")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "beta")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.board_dir("beta") / "kanban.db"))
+
+    class Worker:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, cmd):
+            self.calls.append(cmd)
+            res = kb.remove_board("beta")
+            return f"Board 'beta' archived -> {res['new_path']}"
+
+    worker = Worker()
+    server._sessions[sid] = {"session_key": sid, "agent": None, "slash_worker": worker}
+
+    resp = server.handle_request({
+        "id": "r-kanban-remove",
+        "method": "slash.exec",
+        "params": {"command": "kanban boards rm beta", "session_id": sid},
+    })
+
+    assert "error" not in resp
+    assert worker.calls == ["kanban boards rm beta"]
+    assert server._sessions[sid]["kanban_board"] == "alpha"
+    assert server.os.environ["HERMES_KANBAN_BOARD"] == "beta"
+    assert server.os.environ["HERMES_KANBAN_DB"] == str(kb.board_dir("beta") / "kanban.db")
+
+
+def test_slash_exec_kanban_remove_session_board_ignores_gateway_env_fallback(
+    server, tmp_path, monkeypatch
+):
+    sid = "test-session"
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+
+    from hermes_cli import kanban_db as kb
+
+    kb.create_board("alpha")
+    kb.create_board("beta")
+    kb.set_current_board("alpha")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "beta")
+
+    class Worker:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, cmd):
+            self.calls.append(cmd)
+            res = kb.remove_board("alpha")
+            return f"Board 'alpha' archived → {res['new_path']}"
+
+    worker = Worker()
+    server._sessions[sid] = {
+        "session_key": sid,
+        "agent": None,
+        "slash_worker": worker,
+        "kanban_board": "alpha",
+    }
+
+    resp = server.handle_request({
+        "id": "r-kanban-remove-env-fallback",
+        "method": "slash.exec",
+        "params": {"command": "kanban boards rm alpha", "session_id": sid},
+    })
+
+    assert "error" not in resp
+    assert worker.calls == ["kanban boards rm alpha"]
+    assert server._sessions[sid]["kanban_board"] == "default"
+
+
+def test_slash_exec_recreated_worker_inherits_session_kanban_board(
+    server, tmp_path, monkeypatch
+):
+    sid = "test-session"
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+
+    from hermes_cli import kanban_db as kb
+
+    kb.create_board("alpha")
+    kb.create_board("beta")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "beta")
+
+    created_envs = []
+
+    class Worker:
+        def __init__(self, session_key, model, env=None):
+            created_envs.append(dict(env or server.os.environ))
+
+        def run(self, cmd):
+            return "Board: alpha"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(server, "_SlashWorker", Worker)
+    server._sessions[sid] = {
+        "session_key": sid,
+        "agent": types.SimpleNamespace(model="test-model"),
+        "slash_worker": None,
+        "kanban_board": "alpha",
+    }
+
+    resp = server.handle_request({
+        "id": "r-kanban-recreate",
+        "method": "slash.exec",
+        "params": {"command": "kanban list", "session_id": sid},
+    })
+
+    assert "error" not in resp
+    assert created_envs[0]["HERMES_KANBAN_BOARD"] == "alpha"
+    assert created_envs[0]["HERMES_KANBAN_DB"] == str(kb.board_dir("alpha") / "kanban.db")
+    assert created_envs[0]["HERMES_KANBAN_WORKSPACES_ROOT"] == str(
+        kb.board_dir("alpha") / "workspaces"
+    )
 
 
 @pytest.mark.parametrize("cmd", ["retry", "queue hello", "q hello", "steer fix the test", "plan", "learn create a skill from https://example.com/docs"])

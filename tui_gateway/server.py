@@ -249,7 +249,7 @@ _detached_ws_transport = _DropTransport()
 class _SlashWorker:
     """Persistent HermesCLI subprocess for slash commands."""
 
-    def __init__(self, session_key: str, model: str):
+    def __init__(self, session_key: str, model: str, env: dict | None = None):
         self._lock = threading.Lock()
         self._seq = 0
         self.stderr_tail: list[str] = []
@@ -265,6 +265,10 @@ class _SlashWorker:
         if model:
             argv += ["--model", model]
 
+        run_env = os.environ.copy()
+        if env:
+            run_env.update(env)
+
         self._closed = False
         self.proc = subprocess.Popen(
             argv,
@@ -274,7 +278,7 @@ class _SlashWorker:
             text=True,
             bufsize=1,
             cwd=os.getcwd(),
-            env=os.environ.copy(),
+            env=run_env,
         )
         threading.Thread(target=self._drain_stdout, daemon=True).start()
         threading.Thread(target=self._drain_stderr, daemon=True).start()
@@ -8292,6 +8296,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         approval_token = None
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
+        kanban_scope = contextlib.nullcontext()
         goal_followup = None  # set by the post-turn goal hook below
         try:
             from tools.approval import (
@@ -8304,6 +8309,20 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             _profile_home_str = session.get("profile_home")
             if _profile_home_str:
                 home_token = set_hermes_home_override(_profile_home_str)
+            selected_kanban_board = session.get("kanban_board")
+            if selected_kanban_board:
+                from hermes_cli import kanban_db as _kb
+
+                try:
+                    normed_kanban_board = _kb._normalize_board_slug(
+                        str(selected_kanban_board)
+                    )
+                except ValueError:
+                    normed_kanban_board = None
+                if normed_kanban_board and _kb.board_exists(normed_kanban_board):
+                    kanban_scope = _kb.scoped_current_board(normed_kanban_board)
+                else:
+                    session.pop("kanban_board", None)
             # The sudo password callback is thread-local (tools.terminal_tool
             # _callback_tls), so wiring it on the build thread doesn't reach this
             # turn thread — terminal sudo prompts would fall through to /dev/tty
@@ -8423,7 +8442,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     run_kwargs["task_id"] = session["session_key"]
             except (TypeError, ValueError):
                 pass
-            result = agent.run_conversation(run_message, **run_kwargs)
+            with kanban_scope:
+                result = agent.run_conversation(run_message, **run_kwargs)
             if "moa_one_shot_restore" in session:
                 _restore = session.pop("moa_one_shot_restore", None)
                 if _restore is None:
@@ -12169,13 +12189,82 @@ def _(rid, params: dict) -> dict:
 # ── Methods: slash.exec ──────────────────────────────────────────────
 
 
-def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
+def _mirror_kanban_board_side_effect(session: dict, arg: str, output: str) -> None:
+    if not output or output.startswith("⚠"):
+        return
+
+    try:
+        import argparse
+        import contextlib
+        import io
+        import shlex
+
+        from hermes_cli import kanban as kc
+        from hermes_cli import kanban_db as kb
+
+        tokens = shlex.split(arg)
+        wrapper = argparse.ArgumentParser(prog="/kanban-wrap", add_help=False)
+        wrapper.exit_on_error = False  # type: ignore[attr-defined]
+        subparsers = wrapper.add_subparsers(dest="_top")
+        parser = kc.build_parser(subparsers)
+        parser.prog = "/kanban"
+        parser.exit_on_error = False  # type: ignore[attr-defined]
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            args = parser.parse_args(tokens)
+    except (ValueError, SystemExit, argparse.ArgumentError):
+        return
+
+    if getattr(args, "kanban_action", None) != "boards":
+        return
+    action = getattr(args, "boards_action", None)
+    if action in {"switch", "use"} and len(tokens) >= 3:
+        try:
+            normed = kb._normalize_board_slug(getattr(args, "slug", None))
+        except ValueError:
+            return
+        if (
+            normed
+            and f"Active board is now {normed!r}." in output
+            and kb.board_exists(normed)
+        ):
+            session["kanban_board"] = normed
+        return
+
+    if action in {"create", "new"} and getattr(args, "switch", False):
+        try:
+            normed = kb._normalize_board_slug(getattr(args, "slug", None))
+        except ValueError:
+            return
+        if normed and f"Switched to {normed!r}." in output and kb.board_exists(normed):
+            session["kanban_board"] = normed
+        return
+
+    if action in {"rm", "remove", "delete"}:
+        try:
+            normed = kb._normalize_board_slug(getattr(args, "slug", None))
+        except ValueError:
+            return
+        if (
+            normed
+            and output.startswith(f"Board {normed!r} ")
+            and (" archived" in output or " deleted" in output)
+        ):
+            if (
+                session.get("kanban_board") == normed
+                or kb.runtime_env_matches_board(normed)
+            ):
+                session["kanban_board"] = kb.get_persisted_current_board()
+
+
+def _mirror_slash_side_effects(
+    sid: str, session: dict, command: str, output: str = ""
+) -> str:
     """Apply side effects that must also hit the gateway's live agent."""
     parts = command.lstrip("/").split(None, 1)
     if not parts:
         return ""
     name, arg, agent = (
-        parts[0],
+        parts[0].lower(),
         (parts[1].strip() if len(parts) > 1 else ""),
         session.get("agent"),
     )
@@ -12258,9 +12347,27 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             from tools.process_registry import process_registry
 
             process_registry.kill_all()
+        elif name == "kanban" and arg:
+            _mirror_kanban_board_side_effect(session, arg, output)
     except Exception as e:
         return f"live session sync failed: {e}"
     return ""
+
+
+def _session_kanban_worker_env(session: dict) -> dict | None:
+    selected = session.get("kanban_board")
+    if not selected:
+        return None
+    try:
+        from hermes_cli import kanban_db as kb
+
+        normed = kb._normalize_board_slug(str(selected))
+        if normed and kb.board_exists(normed):
+            return kb.board_runtime_env(normed)
+    except Exception:
+        pass
+    session.pop("kanban_board", None)
+    return None
 
 
 @method("slash.exec")
@@ -12342,6 +12449,7 @@ def _(rid, params: dict) -> dict:
             worker = _SlashWorker(
                 session["session_key"],
                 getattr(session.get("agent"), "model", _resolve_model()),
+                env=_session_kanban_worker_env(session),
             )
             _attach_worker(params.get("session_id", ""), session, worker)
         except Exception as e:
@@ -12349,7 +12457,9 @@ def _(rid, params: dict) -> dict:
 
     try:
         output = worker.run(cmd)
-        warning = _mirror_slash_side_effects(params.get("session_id", ""), session, cmd)
+        warning = _mirror_slash_side_effects(
+            params.get("session_id", ""), session, cmd, output
+        )
         payload = {"output": output or "(no output)"}
         if warning:
             payload["warning"] = warning

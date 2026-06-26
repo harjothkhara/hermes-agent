@@ -1038,10 +1038,14 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
 def _board_task_counts(slug: str) -> dict[str, int]:
     """Return ``{status: count}`` for a board. Safe to call on an empty DB."""
     try:
-        path = kb.kanban_db_path(board=slug)
+        use_effective_default = (
+            slug == kb.DEFAULT_BOARD and kb.get_current_board() == kb.DEFAULT_BOARD
+        )
+        path = kb.kanban_db_path() if use_effective_default else kb.kanban_db_path(board=slug)
         if not path.exists():
             return {}
-        with kb.connect_closing(board=slug) as conn:
+        connect_kwargs = {} if use_effective_default else {"board": slug}
+        with kb.connect_closing(**connect_kwargs) as conn:
             rows = conn.execute(
                 "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
             ).fetchall()
@@ -1085,6 +1089,21 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _set_current_board_for_session(slug: str) -> None:
+    """Persist the active board and refresh this process's board pin."""
+    kb.set_current_board(slug)
+    kb.select_board_for_current_process(slug)
+
+
+def _refresh_current_board_for_session() -> None:
+    """Refresh this process's board pin from the effective current board."""
+    kb.select_board_for_current_process(kb.get_current_board())
+
+
+def _session_pins_match_board(slug: str) -> bool:
+    return kb.runtime_env_matches_board(slug)
+
+
 def _cmd_boards_create(args: argparse.Namespace) -> int:
     try:
         normed = kb._normalize_board_slug(args.slug)
@@ -1108,7 +1127,7 @@ def _cmd_boards_create(args: argparse.Namespace) -> int:
     print(f"  Display name: {meta.get('name', '')}")
     print(f"  DB path:      {meta['db_path']}")
     if getattr(args, "switch", False):
-        kb.set_current_board(meta["slug"])
+        _set_current_board_for_session(meta["slug"])
         print(f"  Switched to {meta['slug']!r}.")
     else:
         print(f"  Use `hermes kanban boards switch {meta['slug']}` to make it current.")
@@ -1122,10 +1141,20 @@ def _cmd_boards_rm(args: argparse.Namespace) -> int:
     # and treat it identically to `boards rm --delete` (fixes #23139).
     force_delete = getattr(args, "delete", False) or getattr(args, "boards_action", "") == "delete"
     try:
+        removing = kb._normalize_board_slug(args.slug)
+    except ValueError:
+        removing = None
+    refresh_session = bool(
+        removing
+        and (kb.get_current_board() == removing or _session_pins_match_board(removing))
+    )
+    try:
         res = kb.remove_board(args.slug, archive=not force_delete)
     except ValueError as exc:
         print(f"kanban boards rm: {exc}", file=sys.stderr)
         return 1
+    if refresh_session:
+        _refresh_current_board_for_session()
     if res["action"] == "archived":
         print(f"Board {res['slug']!r} archived → {res['new_path']}")
         print("Recover by moving the directory back to "
@@ -1151,7 +1180,7 @@ def _cmd_boards_switch(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    kb.set_current_board(normed)
+    _set_current_board_for_session(normed)
     print(f"Active board is now {normed!r}.")
     return 0
 

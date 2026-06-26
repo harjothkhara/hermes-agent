@@ -528,6 +528,13 @@ def _make_run_env(env: dict) -> dict:
     except Exception:
         pass
 
+    try:
+        from hermes_cli.kanban_db import scoped_board_runtime_env
+
+        run_env.update(scoped_board_runtime_env())
+    except Exception:
+        pass
+
     return run_env
 
 

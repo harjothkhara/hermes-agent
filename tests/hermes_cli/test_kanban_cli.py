@@ -566,3 +566,156 @@ def test_run_slash_board_override_does_not_change_boards_show_current(kanban_hom
     out = kc.run_slash("--board beta boards show")
 
     assert "Current board: alpha" in out
+
+
+def test_run_slash_boards_switch_updates_running_session_pin(kanban_home, monkeypatch):
+    kb.create_board("alpha")
+    kb.create_board("beta")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "beta")
+
+    out = kc.run_slash("boards switch alpha")
+
+    assert out == "Active board is now 'alpha'."
+    assert os.environ["HERMES_KANBAN_BOARD"] == "alpha"
+    assert kb.current_board_path().read_text(encoding="utf-8").strip() == "alpha"
+    assert kc.run_slash("list").splitlines()[0].startswith("Board: alpha")
+
+
+def test_run_slash_boards_switch_clears_stale_direct_running_session_pins(
+    kanban_home, monkeypatch
+):
+    kb.create_board("alpha")
+    kb.create_board("beta")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "beta")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.board_dir("beta") / "kanban.db"))
+    monkeypatch.setenv(
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+        str(kb.board_dir("beta") / "workspaces"),
+    )
+
+    out = kc.run_slash("boards switch alpha")
+
+    assert out == "Active board is now 'alpha'."
+    assert os.environ["HERMES_KANBAN_BOARD"] == "alpha"
+    assert "HERMES_KANBAN_DB" not in os.environ
+    assert "HERMES_KANBAN_WORKSPACES_ROOT" not in os.environ
+
+
+def test_run_slash_board_override_beats_session_db_pin(kanban_home, monkeypatch):
+    kb.create_board("alpha")
+    kb.create_board("beta")
+
+    assert kc.run_slash("boards switch alpha") == "Active board is now 'alpha'."
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.board_dir("alpha") / "kanban.db"))
+    monkeypatch.setenv(
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+        str(kb.board_dir("alpha") / "workspaces"),
+    )
+    out = kc.run_slash("--board beta create 'beta-only' --assignee dev")
+
+    assert "Created t_" in out
+    with kb.connect(board="beta") as conn:
+        assert [t.title for t in kb.list_tasks(conn)] == ["beta-only"]
+    with kb.connect(board="alpha") as conn:
+        assert kb.list_tasks(conn) == []
+
+
+def test_run_slash_boards_list_counts_effective_default_direct_db(
+    kanban_home, tmp_path, monkeypatch
+):
+    pinned_db = tmp_path / "custom" / "kanban.db"
+    pinned_db.parent.mkdir()
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned_db))
+
+    kb.init_db()
+    with kb.connect() as conn:
+        kb.create_task(conn, title="pinned task")
+
+    out = kc.run_slash("boards list")
+
+    assert "default" in out
+    assert "ready=1" in out
+
+
+def test_run_slash_boards_create_switch_updates_running_session_pin(kanban_home, monkeypatch):
+    kb.create_board("beta")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "beta")
+
+    out = kc.run_slash("boards create alpha --switch")
+
+    assert "Switched to 'alpha'." in out
+    assert os.environ["HERMES_KANBAN_BOARD"] == "alpha"
+    assert kb.current_board_path().read_text(encoding="utf-8").strip() == "alpha"
+    assert kc.run_slash("list").splitlines()[0].startswith("Board: alpha")
+
+
+def test_run_slash_boards_create_switch_ignores_stale_db_pin_for_new_board(
+    kanban_home, monkeypatch
+):
+    kb.create_board("beta")
+    stale_db = kb.board_dir("beta") / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "beta")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(stale_db))
+
+    out = kc.run_slash("boards create alpha --switch")
+
+    alpha_db = kb.board_dir("alpha") / "kanban.db"
+    assert f"DB path:      {alpha_db}" in out
+    assert "HERMES_KANBAN_DB" not in os.environ
+    assert alpha_db.exists()
+
+
+def test_run_slash_boards_rm_current_refreshes_running_session_pin(kanban_home, monkeypatch):
+    kb.create_board("beta")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "beta")
+
+    out = kc.run_slash("boards rm beta")
+
+    assert "archived" in out
+    assert os.environ["HERMES_KANBAN_BOARD"] == "default"
+    kc.run_slash("boards create beta")
+    assert kb.get_current_board() == "default"
+
+
+def test_run_slash_boards_rm_env_pinned_board_preserves_persisted_current(
+    kanban_home, monkeypatch
+):
+    kb.create_board("alpha")
+    kb.create_board("beta")
+    kb.set_current_board("alpha")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "beta")
+
+    out = kc.run_slash("boards rm beta")
+
+    assert "archived" in out
+    assert kb.current_board_path().read_text(encoding="utf-8").strip() == "alpha"
+    assert os.environ["HERMES_KANBAN_BOARD"] == "alpha"
+
+
+def test_run_slash_boards_rm_refreshes_equivalent_direct_db_pin(
+    kanban_home, monkeypatch
+):
+    kb.create_board("beta")
+    beta_db = kb.board_dir("beta") / ".." / "beta" / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(beta_db))
+
+    out = kc.run_slash("boards rm beta")
+
+    assert "archived" in out
+    assert "HERMES_KANBAN_DB" not in os.environ
+    assert os.environ["HERMES_KANBAN_BOARD"] == "default"
+
+
+def test_run_slash_boards_rm_non_current_does_not_pin_unpinned_session(
+    kanban_home, monkeypatch
+):
+    kb.create_board("alpha")
+    kb.create_board("beta")
+    kb.set_current_board("alpha")
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+
+    out = kc.run_slash("boards rm beta")
+
+    assert "archived" in out
+    assert "HERMES_KANBAN_BOARD" not in os.environ
+    assert kb.get_current_board() == "alpha"

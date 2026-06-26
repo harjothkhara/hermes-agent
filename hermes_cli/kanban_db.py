@@ -27,11 +27,13 @@ Board resolution order (highest precedence first, all optional):
 * ``board=`` argument passed directly to :func:`connect` / :func:`init_db`
   (explicit — used by the CLI ``--board`` flag and the dashboard
   ``?board=...`` query param).
+* A scoped current-board override, used by long-lived sessions to route
+  in-process tools and terminal subprocesses without mutating global env.
+* ``HERMES_KANBAN_DB`` env var when no explicit/scoped board is active
+  (pins the DB file path directly — legacy override still honoured when
+  the file path itself is what the caller wants to force).
 * ``HERMES_KANBAN_BOARD`` env var (used by the dispatcher to pin workers
   to the board their task lives on — workers cannot see other boards).
-* ``HERMES_KANBAN_DB`` env var (pins the DB file path directly — legacy
-  override still honoured; highest precedence when the file path itself
-  is what the caller wants to force).
 * ``<root>/kanban/current`` — a one-line text file holding the slug of
   the "currently selected" board. Written by ``hermes kanban boards
   switch <slug>``. When absent, the active board is ``default``.
@@ -291,6 +293,7 @@ _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
 # ---------------------------------------------------------------------------
 
 DEFAULT_BOARD = "default"
+_DIRECT_PATH_ENV_VARS = ("HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT")
 _CURRENT_BOARD_OVERRIDE: ContextVar[str | None] = ContextVar(
     "hermes_kanban_current_board_override",
     default=None,
@@ -378,11 +381,12 @@ def get_current_board() -> str:
 
     Order (highest precedence first):
 
-    1. ``HERMES_KANBAN_BOARD`` env var (set by the dispatcher on worker
+    1. Scoped current-board override for a live session turn.
+    2. ``HERMES_KANBAN_BOARD`` env var (set by the dispatcher on worker
        spawn, or manually for ad-hoc overrides).
-    2. ``<root>/kanban/current`` on disk (set by ``hermes kanban boards
+    3. ``<root>/kanban/current`` on disk (set by ``hermes kanban boards
        switch``), but only when that board still exists.
-    3. ``DEFAULT_BOARD`` (``"default"``).
+    4. ``DEFAULT_BOARD`` (``"default"``).
 
     A malformed or stale slug at any step falls through to the next layer
     with a best-effort warning — the dispatcher must never crash because a
@@ -405,20 +409,32 @@ def get_current_board() -> str:
                 return normed
         except ValueError:
             pass
+    persisted = _read_persisted_current_board()
+    if persisted:
+        return persisted
+    return DEFAULT_BOARD
+
+
+def _read_persisted_current_board() -> Optional[str]:
+    """Return the valid board slug stored in ``kanban/current``, ignoring env pins."""
     try:
         f = current_board_path()
-        if f.exists():
-            val = f.read_text(encoding="utf-8").strip()
-            if val:
-                try:
-                    normed = _normalize_board_slug(val)
-                    if normed and board_exists(normed):
-                        return normed
-                except ValueError:
-                    pass
-    except OSError:
+        if not f.exists():
+            return None
+        val = f.read_text(encoding="utf-8").strip()
+        if not val:
+            return None
+        normed = _normalize_board_slug(val)
+        if normed and board_exists(normed):
+            return normed
+    except (OSError, ValueError):
         pass
-    return DEFAULT_BOARD
+    return None
+
+
+def get_persisted_current_board(default: str = DEFAULT_BOARD) -> str:
+    """Return the valid persisted current board, ignoring process env pins."""
+    return _read_persisted_current_board() or default
 
 
 def set_current_board(slug: str) -> Path:
@@ -474,51 +490,135 @@ def board_exists(board: Optional[str] = None) -> bool:
     return (d / "board.json").exists() or (d / "kanban.db").exists()
 
 
+def _kanban_db_path_for_slug(slug: str) -> Path:
+    if slug == DEFAULT_BOARD:
+        return kanban_home() / "kanban.db"
+    return board_dir(slug) / "kanban.db"
+
+
+def _workspaces_root_for_slug(slug: str) -> Path:
+    if slug == DEFAULT_BOARD:
+        return kanban_home() / "kanban" / "workspaces"
+    return board_dir(slug) / "workspaces"
+
+
+def _metadata_db_path_for_slug(slug: str) -> Path:
+    if slug == DEFAULT_BOARD:
+        return kanban_db_path(DEFAULT_BOARD)
+    return _kanban_db_path_for_slug(slug)
+
+
 def kanban_db_path(board: Optional[str] = None) -> Path:
     """Return the path to the ``kanban.db`` for ``board``.
 
     Resolution (highest precedence first):
 
-    1. ``HERMES_KANBAN_DB`` env var — pins the path directly. Honoured for
-       back-compat and for the dispatcher→worker handoff (defense in
-       depth: dispatcher injects this into worker env so workers are
-       immune to any path-resolution disagreement).
-    2. When ``board`` arg is None, the active board from
+    1. Explicit ``board`` arg — used by ``--board`` routing and
+       board-scoped dispatcher ticks.
+    2. ``HERMES_KANBAN_DB`` env var — pins the path directly. Honoured for
+       back-compat and for the dispatcher→worker handoff when no explicit
+       board is supplied.
+    3. When ``board`` arg is None, the active board from
        :func:`get_current_board` is used.
-    3. Board ``default`` → ``<root>/kanban.db`` (back-compat path).
+    4. Board ``default`` → ``<root>/kanban.db`` (back-compat path).
        Other boards → ``<root>/kanban/boards/<slug>/kanban.db``.
     """
+    slug = _normalize_board_slug(board)
+    if slug is not None:
+        return _kanban_db_path_for_slug(slug)
+    scoped = (_CURRENT_BOARD_OVERRIDE.get() or "").strip()
+    if scoped:
+        normed = _normalize_board_slug(scoped)
+        if normed and board_exists(normed):
+            return _kanban_db_path_for_slug(normed)
     override = os.environ.get("HERMES_KANBAN_DB", "").strip()
     if override:
         return Path(override).expanduser()
-    slug = _normalize_board_slug(board)
-    if slug is None:
-        slug = get_current_board()
-    if slug == DEFAULT_BOARD:
-        return kanban_home() / "kanban.db"
-    return board_dir(slug) / "kanban.db"
+    slug = get_current_board()
+    return _kanban_db_path_for_slug(slug)
 
 
 def workspaces_root(board: Optional[str] = None) -> Path:
     """Return the directory under which ``scratch`` workspaces are created.
 
     Anchored per-board so workspaces don't leak between projects.
-    ``HERMES_KANBAN_WORKSPACES_ROOT`` pins the path directly (highest
-    precedence) — the dispatcher injects this into worker env.
+    Explicit ``board`` args outrank ``HERMES_KANBAN_WORKSPACES_ROOT`` so
+    ``--board`` routing and board-scoped dispatcher ticks cannot be
+    captured by a stale process-level path pin. Without an explicit board,
+    ``HERMES_KANBAN_WORKSPACES_ROOT`` remains a direct override — the
+    dispatcher injects it into worker env.
 
     ``default`` keeps the legacy path ``<root>/kanban/workspaces/`` so
     that existing scratch workspaces from before the boards feature are
     preserved. Other boards use ``<root>/kanban/boards/<slug>/workspaces/``.
     """
+    slug = _normalize_board_slug(board)
+    if slug is not None:
+        return _workspaces_root_for_slug(slug)
+    scoped = (_CURRENT_BOARD_OVERRIDE.get() or "").strip()
+    if scoped:
+        normed = _normalize_board_slug(scoped)
+        if normed and board_exists(normed):
+            return _workspaces_root_for_slug(normed)
     override = os.environ.get("HERMES_KANBAN_WORKSPACES_ROOT", "").strip()
     if override:
         return Path(override).expanduser()
-    slug = _normalize_board_slug(board)
-    if slug is None:
-        slug = get_current_board()
-    if slug == DEFAULT_BOARD:
-        return kanban_home() / "kanban" / "workspaces"
-    return board_dir(slug) / "workspaces"
+    return _workspaces_root_for_slug(get_current_board())
+
+
+def board_runtime_env(board: Optional[str] = None) -> dict[str, str]:
+    """Return child worker env pins for ``board`` without honoring stale pins."""
+    slug = _normalize_board_slug(board) or get_current_board()
+    return {
+        "HERMES_KANBAN_BOARD": slug,
+        "HERMES_KANBAN_DB": str(_kanban_db_path_for_slug(slug)),
+        "HERMES_KANBAN_WORKSPACES_ROOT": str(_workspaces_root_for_slug(slug)),
+    }
+
+
+def _same_runtime_path(left: str, right: str) -> bool:
+    try:
+        return Path(left).expanduser().resolve() == Path(right).expanduser().resolve()
+    except OSError:
+        return Path(left).expanduser().absolute() == Path(right).expanduser().absolute()
+
+
+def runtime_env_matches_board(
+    board: Optional[str] = None,
+    environ: Optional[dict[str, str]] = None,
+) -> bool:
+    """Return whether ``environ`` contains any runtime pin for ``board``."""
+    env = os.environ if environ is None else environ
+    pins = board_runtime_env(board)
+    for name, expected in pins.items():
+        actual = env.get(name)
+        if not actual:
+            continue
+        if name in _DIRECT_PATH_ENV_VARS:
+            if _same_runtime_path(actual, expected):
+                return True
+        elif actual == expected:
+            return True
+    return False
+
+
+def scoped_board_runtime_env() -> dict[str, str]:
+    """Return child env pins for an active scoped board, if any."""
+    scoped = (_CURRENT_BOARD_OVERRIDE.get() or "").strip()
+    if not scoped:
+        return {}
+    normed = _normalize_board_slug(scoped)
+    if not normed or not board_exists(normed):
+        return {}
+    return board_runtime_env(normed)
+
+
+def select_board_for_current_process(board: Optional[str] = None) -> None:
+    """Select ``board`` in this process and clear stale direct path pins."""
+    slug = _normalize_board_slug(board) or get_current_board()
+    os.environ["HERMES_KANBAN_BOARD"] = slug
+    for name in _DIRECT_PATH_ENV_VARS:
+        os.environ.pop(name, None)
 
 
 def attachments_root(board: Optional[str] = None) -> Path:
@@ -623,7 +723,7 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
                 meta.update(raw)
     except (OSError, json.JSONDecodeError):
         pass
-    meta["db_path"] = str(kanban_db_path(slug))
+    meta["db_path"] = str(_metadata_db_path_for_slug(slug))
     return meta
 
 
@@ -667,7 +767,7 @@ def write_board_metadata(
         json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
-    meta["db_path"] = str(kanban_db_path(slug))
+    meta["db_path"] = str(_metadata_db_path_for_slug(slug))
     return meta
 
 
@@ -766,8 +866,10 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     if not d.exists():
         raise ValueError(f"board {normed!r} does not exist")
 
-    # If the user removed the currently-active board, revert to default.
-    if get_current_board() == normed:
+    # Only clear the persisted current-board file if that file names the
+    # removed board. A process-local env pin can point at another board without
+    # implying that the user's saved current board should be reset.
+    if _read_persisted_current_board() == normed:
         clear_current_board()
 
     # A concurrent connect(board=normed) after the rename/delete recreates
@@ -1659,7 +1761,7 @@ def connect(
 
     * ``db_path`` explicit → used as-is (legacy callers, tests).
     * ``board`` explicit → resolves to that board's DB.
-    * Neither → :func:`kanban_db_path` resolves via
+    * Neither → :func:`kanban_db_path` resolves via scoped board →
       ``HERMES_KANBAN_DB`` env → ``HERMES_KANBAN_BOARD`` env →
       ``<root>/kanban/current`` → ``default``.
     """
