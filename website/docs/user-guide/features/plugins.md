@@ -151,9 +151,15 @@ plugins:
   enabled:
     - my-tool-plugin
     - disk-cleanup
-  disabled:       # optional deny-list — always wins if a name appears in both
+  disabled:       # optional deny-list - wins if a name appears in both
     - noisy-plugin
 ```
+
+Bundled gateway platform adapters such as Discord, Slack, and Telegram are the
+exception: Hermes registers them as built-in channel inventory, so stale
+`plugins.disabled` entries are ignored for those adapters. Disable a channel
+with `platforms.<name>.enabled: false` or the equivalent
+`gateway.platforms.<name>.enabled: false` instead.
 
 Three ways to flip state:
 
@@ -171,7 +177,7 @@ Several categories of plugin bypass `plugins.enabled` — they're part of Hermes
 
 | Plugin kind | How it's activated instead |
 |---|---|
-| **Bundled platform plugins** (IRC, Teams, etc. under `plugins/platforms/`) | Auto-loaded so every shipped gateway channel is available. The actual channel turns on via `gateway.platforms.<name>.enabled` in `config.yaml`. |
+| **Bundled platform plugins** (IRC, Teams, etc. under `plugins/platforms/`) | Auto-loaded so every shipped gateway channel is available. The actual channel turns on via `platforms.<name>.enabled` or `gateway.platforms.<name>.enabled` in `config.yaml`. |
 | **Bundled backends** (image-gen providers under `plugins/image_gen/`, etc.) | Auto-loaded so the default backend "just works". Selection happens via `<category>.provider` in `config.yaml` (e.g. `image_gen.provider: openai`). |
 | **Memory providers** (`plugins/memory/`) | All discovered; exactly one is active, chosen by `memory.provider` in `config.yaml`. |
 | **Context engines** (`plugins/context_engine/`) | All discovered; one is active, chosen by `context.engine` in `config.yaml`. |
@@ -294,7 +300,7 @@ Plugins
 
 - **General Plugins section** — checkboxes, toggle with SPACE. Checked = in `plugins.enabled`, unchecked = in `plugins.disabled` (explicit off).
 - **Provider Plugins section** — shows current selection. Press ENTER to drill into a radio picker where you choose one active provider.
-- Bundled plugins appear in the same list with a `[bundled]` tag.
+- Bundled plugins appear in the same list with a `[bundled]` tag, except bundled gateway platform adapters. Platform adapters are always registered and are controlled under `platforms.<name>.enabled` or `gateway.platforms.<name>.enabled`.
 
 Provider plugin selections are saved to `config.yaml`:
 
@@ -316,7 +322,11 @@ Plugins occupy one of three states:
 | `disabled` | Explicitly off — won't load even if also in `enabled` | (irrelevant) | Yes |
 | `not enabled` | Discovered but never opted in | No | No |
 
-The default for a newly-installed or bundled plugin is `not enabled`. `hermes plugins list` shows all three distinct states so you can tell what's been explicitly turned off vs. what's just waiting to be enabled.
+The default for a newly-installed general plugin is `not enabled`; bundled platform adapters are registered automatically and report their channel state instead. `hermes plugins list` shows all three distinct states so you can tell what's been explicitly turned off vs. what's just waiting to be enabled.
+
+Bundled gateway platform adapters are a special case: Hermes registers their adapters automatically, and `plugins.disabled` entries for them are treated as stale migration leftovers. Use `platforms.<name>.enabled: false` or `gateway.platforms.<name>.enabled: false` to turn a channel off.
+The dashboard's channel controls write the top-level `platforms.<name>.enabled` form.
+Because these adapters are registered automatically, `hermes plugins list --enabled` includes bundled platform adapters unless their channel is explicitly disabled.
 
 In a running session, `/plugins` shows which plugins are currently loaded.
 

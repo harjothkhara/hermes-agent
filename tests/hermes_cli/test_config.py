@@ -796,6 +796,171 @@ class TestAnthropicTokenMigration:
             assert load_env().get("ANTHROPIC_TOKEN") == "current-token"
 
 
+class TestBundledPlatformDisabledMigration:
+    def test_migrate_cleans_stale_bundled_platform_disabled_entries(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump({
+                "_config_version": 31,
+                "plugins": {
+                    "disabled": [
+                        "discord-platform",
+                        "platforms/slack",
+                        "telegram",
+                        "disk-cleanup",
+                    ],
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            results = migrate_config(interactive=False, quiet=True)
+            raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        assert raw["_config_version"] == DEFAULT_CONFIG["_config_version"]
+        assert raw["plugins"]["disabled"] == ["disk-cleanup"]
+        assert any(
+            item.startswith("plugins.disabled cleaned 3 stale bundled platform")
+            for item in results["config_added"]
+        )
+
+    def test_migrate_preserves_disabled_user_plugin_that_collides_with_platform_alias(
+        self, tmp_path
+    ):
+        plugin_dir = tmp_path / "plugins" / "discord"
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "__init__.py").write_text(
+            "def register(ctx): pass\n",
+            encoding="utf-8",
+        )
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump({
+                "_config_version": 31,
+                "plugins": {
+                    "enabled": ["discord"],
+                    "disabled": ["discord", "discord-platform"],
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            migrate_config(interactive=False, quiet=True)
+            raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        assert raw["plugins"]["disabled"] == ["discord"]
+
+    def test_migrate_uses_bundled_plugins_override_for_platform_aliases(
+        self, tmp_path
+    ):
+        bundled = tmp_path / "store_plugins"
+        platform_dir = bundled / "platforms" / "nixonly"
+        platform_dir.mkdir(parents=True)
+        (platform_dir / "plugin.yaml").write_text(
+            yaml.safe_dump({
+                "name": "nixonly-platform",
+                "kind": "platform",
+                "version": "1.0.0",
+            }),
+            encoding="utf-8",
+        )
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump({
+                "_config_version": 31,
+                "plugins": {"disabled": ["nixonly-platform"]},
+            }),
+            encoding="utf-8",
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "HERMES_HOME": str(tmp_path),
+                "HERMES_BUNDLED_PLUGINS": str(bundled),
+            },
+        ):
+            migrate_config(interactive=False, quiet=True)
+            raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        assert raw["plugins"]["disabled"] == []
+
+    def test_migrate_preserves_disabled_project_plugin_collision(
+        self, tmp_path, monkeypatch
+    ):
+        project_plugin = tmp_path / ".hermes" / "plugins" / "discord"
+        project_plugin.mkdir(parents=True)
+        (project_plugin / "plugin.yaml").write_text(
+            yaml.safe_dump({
+                "name": "discord",
+                "kind": "standalone",
+                "version": "1.0.0",
+            }),
+            encoding="utf-8",
+        )
+        (project_plugin / "__init__.py").write_text(
+            "def register(ctx): pass\n",
+            encoding="utf-8",
+        )
+        hermes_home = tmp_path / "home"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump({
+                "_config_version": 31,
+                "plugins": {"disabled": ["discord"]},
+            }),
+            encoding="utf-8",
+        )
+
+        monkeypatch.chdir(tmp_path)
+        with patch.dict(
+            os.environ,
+            {
+                "HERMES_HOME": str(hermes_home),
+                "HERMES_ENABLE_PROJECT_PLUGINS": "1",
+            },
+        ):
+            migrate_config(interactive=False, quiet=True)
+            raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        assert raw["plugins"]["disabled"] == ["discord"]
+
+    def test_migrate_ignores_inactive_project_plugin_collision(
+        self, tmp_path, monkeypatch
+    ):
+        project_plugin = tmp_path / ".hermes" / "plugins" / "discord"
+        project_plugin.mkdir(parents=True)
+        (project_plugin / "plugin.yaml").write_text(
+            yaml.safe_dump({
+                "name": "discord",
+                "kind": "standalone",
+                "version": "1.0.0",
+            }),
+            encoding="utf-8",
+        )
+        hermes_home = tmp_path / "home"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump({
+                "_config_version": 31,
+                "plugins": {"disabled": ["discord"]},
+            }),
+            encoding="utf-8",
+        )
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("HERMES_ENABLE_PROJECT_PLUGINS", raising=False)
+        with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
+            migrate_config(interactive=False, quiet=True)
+            raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        assert raw["plugins"]["disabled"] == []
+
+
 class TestCustomProviderCompatibility:
     """Custom provider compatibility across legacy and v12+ config schemas."""
 

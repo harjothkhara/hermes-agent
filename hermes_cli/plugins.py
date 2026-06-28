@@ -209,7 +209,9 @@ def _get_disabled_plugins() -> set:
 
     Kept for backward compat and explicit deny-list semantics. A plugin
     name in this set will never load, even if it appears in
-    ``plugins.enabled``.
+    ``plugins.enabled``. The general loader makes one runtime-compat
+    exception for bundled platform adapters, whose channel activation is
+    controlled by ``gateway.platforms.<name>.enabled``.
     """
     try:
         from hermes_cli.config import load_config
@@ -1272,17 +1274,86 @@ class PluginManager:
         winners: Dict[str, PluginManifest] = {}
         for manifest in manifests:
             winners[manifest.key or manifest.name] = manifest
+        non_platform_aliases: Set[str] = set()
+        for manifest in winners.values():
+            if manifest.source == "bundled" and manifest.kind == "platform":
+                continue
+            alias_key = manifest.key or manifest.name
+            non_platform_aliases.update({alias_key, manifest.name})
+            if "/" in alias_key:
+                non_platform_aliases.add(alias_key.split("/")[-1])
         for manifest in winners.values():
             lookup_key = manifest.key or manifest.name
 
-            # Explicit disable always wins (matches on key or on legacy
-            # bare name for back-compat with existing user configs).
-            if lookup_key in disabled or manifest.name in disabled:
+            # Intentionally platform-only: bundled backends may still be
+            # suppressed with plugins.disabled, but bundled platform adapters
+            # are gateway inventory controlled by gateway.platforms.<name>.
+            is_bundled_platform = (
+                manifest.source == "bundled" and manifest.kind == "platform"
+            )
+            disabled_aliases = {lookup_key, manifest.name}
+            if is_bundled_platform:
+                platform_key = (
+                    Path(manifest.path).name
+                    if manifest.path
+                    else manifest.name.removesuffix("-platform")
+                )
+                platform_keys = [platform_key]
+                disabled_aliases.update({platform_key, f"platforms/{platform_key}"})
+                try:
+                    manifest_file = Path(manifest.path) / "plugin.yaml"
+                    if not manifest_file.exists():
+                        manifest_file = Path(manifest.path) / "plugin.yml"
+                    data = yaml.safe_load(manifest_file.read_text(encoding="utf-8")) or {}
+                except Exception:
+                    data = {}
+                for scalar_key in ("id", "gateway_key", "platform_key"):
+                    value = data.get(scalar_key)
+                    if isinstance(value, str) and value.strip():
+                        key = value.strip()
+                        if key not in platform_keys:
+                            platform_keys.append(key)
+                        disabled_aliases.update({key, f"platforms/{key}"})
+                for list_key in ("gateway_keys", "platform_keys"):
+                    values = data.get(list_key)
+                    if isinstance(values, list):
+                        for value in values:
+                            if isinstance(value, str) and value.strip():
+                                key = value.strip()
+                                if key not in platform_keys:
+                                    platform_keys.append(key)
+                                disabled_aliases.update({key, f"platforms/{key}"})
+            configured_disabled_aliases = disabled_aliases & disabled
+            stale_platform_disabled_aliases = (
+                configured_disabled_aliases - non_platform_aliases
+            )
+            disabled_by_config = bool(configured_disabled_aliases)
+
+            # Explicit disable always wins for non-platform plugins
+            # (matches on key or on legacy bare name for back-compat with
+            # existing user configs). Bundled platform plugins are gateway
+            # adapter inventory: their runtime activation is controlled by
+            # gateway.platforms.<name>.enabled, so stale plugins.disabled
+            # entries from pre-bundled migrations must not hide the adapter.
+            if disabled_by_config and not is_bundled_platform:
                 loaded = LoadedPlugin(manifest=manifest, enabled=False)
                 loaded.error = "disabled via config"
                 self._plugins[lookup_key] = loaded
                 logger.debug("Skipping disabled plugin '%s'", lookup_key)
                 continue
+            if is_bundled_platform and stale_platform_disabled_aliases:
+                config_hint = ", ".join(
+                    f"platforms.{key}.enabled "
+                    f"(or gateway.platforms.{key}.enabled)"
+                    for key in platform_keys
+                )
+                logger.warning(
+                    "Ignoring stale plugins.disabled entry for bundled platform "
+                    "plugin '%s'; disable the channel with "
+                    "%s instead",
+                    lookup_key,
+                    config_hint,
+                )
 
             # Exclusive plugins (memory providers) have their own
             # discovery/activation path. The general loader records the

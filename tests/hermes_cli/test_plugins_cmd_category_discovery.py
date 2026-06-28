@@ -221,6 +221,35 @@ class TestDiscoverAllPlugins:
         entry = [e for e in entries if e[5] == "my-plugin"][0]
         assert entry[1] == "2.0.0"
 
+    @patch("hermes_cli.plugins.get_bundled_plugins_dir")
+    @patch("hermes_cli.plugins_cmd._plugins_dir")
+    def test_bundled_platform_key_matches_runtime_loader(
+        self, mock_user_dir, mock_bundled_dir, tmp_path
+    ):
+        """Bundled platforms use manifest names, not platforms/<dir> keys."""
+        from hermes_cli.plugins_cmd import _discover_all_plugins
+
+        bundled_dir = tmp_path / "bundled"
+        _make_category_plugin(
+            bundled_dir,
+            "platforms",
+            "discord",
+            {
+                "name": "discord-platform",
+                "kind": "platform",
+                "version": "1.0.0",
+            },
+        )
+        user_dir = tmp_path / "user"
+        user_dir.mkdir()
+        mock_user_dir.return_value = user_dir
+        mock_bundled_dir.return_value = bundled_dir
+
+        entries = _discover_all_plugins()
+        keys = [e[5] for e in entries]
+        assert "discord-platform" in keys
+        assert "platforms/discord" not in keys
+
 
 # ---------------------------------------------------------------------------
 # _plugin_status — key-aware status
@@ -244,6 +273,62 @@ class TestPluginStatus:
         from hermes_cli.plugins_cmd import _plugin_status
         assert _plugin_status("web-tavily", set(), {"web/tavily"}, key="web/tavily") == "disabled"
 
+    def test_bundled_platform_config_keys_use_declared_gateway_keys(self, tmp_path):
+        from hermes_cli.plugins_cmd import _bundled_platform_config_keys
+
+        platform_dir = _make_plugin_dir(tmp_path, "wecom", {
+            "name": "wecom-platform",
+            "kind": "platform",
+            "version": "1.0.0",
+            "gateway_keys": ["wecom", "wecom_callback"],
+        })
+        entry = (
+            "wecom-platform",
+            "1.0.0",
+            "",
+            "bundled",
+            platform_dir,
+            "wecom-platform",
+        )
+
+        assert _bundled_platform_config_keys(entry) == ("wecom", "wecom_callback")
+
+    def test_multi_key_platform_status_requires_all_keys_disabled(self, tmp_path):
+        from hermes_cli.plugins_cmd import _entry_status
+
+        platform_dir = _make_plugin_dir(tmp_path, "wecom", {
+            "name": "wecom-platform",
+            "kind": "platform",
+            "version": "1.0.0",
+            "gateway_keys": ["wecom", "wecom_callback"],
+        })
+        entry = (
+            "wecom-platform",
+            "1.0.0",
+            "",
+            "bundled",
+            platform_dir,
+            "wecom-platform",
+        )
+
+        assert _entry_status(
+            entry,
+            set(),
+            set(),
+            {"platforms": {"wecom": {"enabled": False}}},
+        ) == "enabled"
+        assert _entry_status(
+            entry,
+            set(),
+            set(),
+            {
+                "platforms": {
+                    "wecom": {"enabled": False},
+                    "wecom_callback": {"enabled": False},
+                },
+            },
+        ) == "disabled"
+
     def test_neither_name_nor_key(self):
         from hermes_cli.plugins_cmd import _plugin_status
         assert _plugin_status("unknown", {"other"}, set(), key="cat/unknown") == "not enabled"
@@ -255,6 +340,67 @@ class TestPluginStatus:
     def test_key_disabled_takes_precedence(self):
         from hermes_cli.plugins_cmd import _plugin_status
         assert _plugin_status("web-tavily", {"web/tavily"}, {"web/tavily"}, key="web/tavily") == "disabled"
+
+    def test_bundled_platform_entry_ignores_stale_disabled(self, tmp_path):
+        from hermes_cli.plugins_cmd import _entry_status
+
+        platform_dir = tmp_path / "platforms" / "discord"
+        _make_plugin_dir(platform_dir.parent, "discord", {
+            "name": "discord-platform",
+            "kind": "platform",
+        })
+        entry = (
+            "discord-platform",
+            "1.0.0",
+            "Discord",
+            "bundled",
+            platform_dir,
+            "discord-platform",
+        )
+
+        assert _entry_status(entry, set(), {"discord-platform"}) == "enabled"
+
+    def test_bundled_platform_aliases_include_channel_and_legacy_key(self, tmp_path):
+        from hermes_cli.plugins_cmd import _plugin_config_aliases_for_entry
+
+        platform_dir = tmp_path / "platforms" / "discord"
+        _make_plugin_dir(platform_dir.parent, "discord", {
+            "name": "discord-platform",
+            "kind": "platform",
+        })
+        entry = (
+            "discord-platform",
+            "1.0.0",
+            "Discord",
+            "bundled",
+            platform_dir,
+            "discord-platform",
+        )
+
+        aliases = _plugin_config_aliases_for_entry(entry)
+        assert "discord" in aliases
+        assert "platforms/discord" in aliases
+
+    def test_bundled_platform_entry_accepts_yml_manifest(self, tmp_path):
+        from hermes_cli.plugins_cmd import _is_bundled_platform_entry, _read_manifest
+
+        platform_dir = tmp_path / "platforms" / "discord"
+        platform_dir.mkdir(parents=True)
+        (platform_dir / "plugin.yml").write_text(
+            "name: discord-platform\nkind: platform\n",
+            encoding="utf-8",
+        )
+        _read_manifest.cache_clear()
+        entry = (
+            "discord-platform",
+            "1.0.0",
+            "Discord",
+            "bundled",
+            platform_dir,
+            "discord-platform",
+        )
+
+        assert _is_bundled_platform_entry(entry)
 
 
 # ---------------------------------------------------------------------------
@@ -353,3 +499,257 @@ class TestCmdListJson:
             payload = json.loads(captured.out)
             assert len(payload) == 1
             assert payload[0]["status"] == "enabled"
+
+    @patch("hermes_cli.plugins.get_bundled_plugins_dir")
+    @patch("hermes_cli.plugins_cmd._plugins_dir")
+    def test_json_status_ignores_stale_disabled_for_bundled_platform(
+        self, mock_user_dir, mock_bundled_dir, tmp_path, capsys
+    ):
+        from hermes_cli.plugins_cmd import cmd_list
+
+        bundled_dir = tmp_path / "bundled"
+        _make_category_plugin(
+            bundled_dir,
+            "platforms",
+            "discord",
+            {
+                "name": "discord-platform",
+                "kind": "platform",
+                "version": "1.0.0",
+            },
+        )
+        user_dir = tmp_path / "user"
+        user_dir.mkdir()
+        mock_user_dir.return_value = user_dir
+        mock_bundled_dir.return_value = bundled_dir
+
+        with patch("hermes_cli.plugins_cmd._get_enabled_set", return_value=set()), \
+             patch("hermes_cli.plugins_cmd._get_disabled_set", return_value={"discord-platform"}):
+            args = MagicMock()
+            args.json = True
+            args.plain = False
+            args.no_bundled = False
+            args.user = False
+            args.enabled = False
+
+            cmd_list(args)
+            captured = capsys.readouterr()
+            payload = json.loads(captured.out)
+            assert payload == [
+                {
+                    "name": "discord-platform",
+                    "status": "enabled",
+                    "version": "1.0.0",
+                    "description": "",
+                    "source": "bundled",
+                }
+            ]
+
+    @patch("hermes_cli.plugins.get_bundled_plugins_dir")
+    @patch("hermes_cli.plugins_cmd._plugins_dir")
+    def test_json_status_respects_gateway_disabled_for_bundled_platform(
+        self, mock_user_dir, mock_bundled_dir, tmp_path, capsys
+    ):
+        from hermes_cli.plugins_cmd import cmd_list
+
+        bundled_dir = tmp_path / "bundled"
+        _make_category_plugin(
+            bundled_dir,
+            "platforms",
+            "discord",
+            {
+                "name": "discord-platform",
+                "kind": "platform",
+                "version": "1.0.0",
+            },
+        )
+        user_dir = tmp_path / "user"
+        user_dir.mkdir()
+        mock_user_dir.return_value = user_dir
+        mock_bundled_dir.return_value = bundled_dir
+
+        with patch("hermes_cli.plugins_cmd._get_enabled_set", return_value=set()), \
+             patch("hermes_cli.plugins_cmd._get_disabled_set", return_value=set()), \
+             patch("hermes_cli.plugins_cmd._load_status_config", return_value={
+                 "gateway": {"platforms": {"discord": {"enabled": False}}},
+             }):
+            args = MagicMock()
+            args.json = True
+            args.plain = False
+            args.no_bundled = False
+            args.user = False
+            args.enabled = False
+
+            cmd_list(args)
+            captured = capsys.readouterr()
+            payload = json.loads(captured.out)
+            assert payload[0]["name"] == "discord-platform"
+            assert payload[0]["status"] == "disabled"
+
+    @patch("hermes_cli.plugins.get_bundled_plugins_dir")
+    @patch("hermes_cli.plugins_cmd._plugins_dir")
+    def test_json_status_respects_top_level_platform_disabled_for_bundled_platform(
+        self, mock_user_dir, mock_bundled_dir, tmp_path, capsys
+    ):
+        from hermes_cli.plugins_cmd import cmd_list
+
+        bundled_dir = tmp_path / "bundled"
+        _make_category_plugin(
+            bundled_dir,
+            "platforms",
+            "discord",
+            {
+                "name": "discord-platform",
+                "kind": "platform",
+                "version": "1.0.0",
+            },
+        )
+        user_dir = tmp_path / "user"
+        user_dir.mkdir()
+        mock_user_dir.return_value = user_dir
+        mock_bundled_dir.return_value = bundled_dir
+
+        with patch("hermes_cli.plugins_cmd._get_enabled_set", return_value=set()), \
+             patch("hermes_cli.plugins_cmd._get_disabled_set", return_value=set()), \
+             patch("hermes_cli.plugins_cmd._load_status_config", return_value={
+                 "platforms": {"discord": {"enabled": False}},
+             }):
+            args = MagicMock()
+            args.json = True
+            args.plain = False
+            args.no_bundled = False
+            args.user = False
+            args.enabled = False
+
+            cmd_list(args)
+            captured = capsys.readouterr()
+            payload = json.loads(captured.out)
+            assert payload[0]["name"] == "discord-platform"
+            assert payload[0]["status"] == "disabled"
+
+    @patch("hermes_cli.plugins.get_bundled_plugins_dir")
+    @patch("hermes_cli.plugins_cmd._plugins_dir")
+    def test_json_status_top_level_platform_config_overrides_gateway_platform(
+        self, mock_user_dir, mock_bundled_dir, tmp_path, capsys
+    ):
+        from hermes_cli.plugins_cmd import cmd_list
+
+        bundled_dir = tmp_path / "bundled"
+        _make_category_plugin(
+            bundled_dir,
+            "platforms",
+            "discord",
+            {
+                "name": "discord-platform",
+                "kind": "platform",
+                "version": "1.0.0",
+            },
+        )
+        user_dir = tmp_path / "user"
+        user_dir.mkdir()
+        mock_user_dir.return_value = user_dir
+        mock_bundled_dir.return_value = bundled_dir
+
+        with patch("hermes_cli.plugins_cmd._get_enabled_set", return_value=set()), \
+             patch("hermes_cli.plugins_cmd._get_disabled_set", return_value=set()), \
+             patch("hermes_cli.plugins_cmd._load_status_config", return_value={
+                 "gateway": {"platforms": {"discord": {"enabled": False}}},
+                 "platforms": {"discord": {"enabled": True}},
+             }):
+            args = MagicMock()
+            args.json = True
+            args.plain = False
+            args.no_bundled = False
+            args.user = False
+            args.enabled = False
+
+            cmd_list(args)
+            captured = capsys.readouterr()
+            payload = json.loads(captured.out)
+            assert payload[0]["name"] == "discord-platform"
+            assert payload[0]["status"] == "enabled"
+
+    @patch("hermes_cli.plugins.get_bundled_plugins_dir")
+    @patch("hermes_cli.plugins_cmd._plugins_dir")
+    @pytest.mark.parametrize("enabled_value", ["false", "0", "no", "off", "maybe"])
+    def test_json_status_respects_direct_top_level_platform_bool_string(
+        self, mock_user_dir, mock_bundled_dir, tmp_path, capsys, enabled_value
+    ):
+        from hermes_cli.plugins_cmd import cmd_list
+
+        bundled_dir = tmp_path / "bundled"
+        _make_category_plugin(
+            bundled_dir,
+            "platforms",
+            "discord",
+            {
+                "name": "discord-platform",
+                "kind": "platform",
+                "version": "1.0.0",
+            },
+        )
+        user_dir = tmp_path / "user"
+        user_dir.mkdir()
+        mock_user_dir.return_value = user_dir
+        mock_bundled_dir.return_value = bundled_dir
+
+        with patch("hermes_cli.plugins_cmd._get_enabled_set", return_value=set()), \
+             patch("hermes_cli.plugins_cmd._get_disabled_set", return_value=set()), \
+             patch("hermes_cli.plugins_cmd._load_status_config", return_value={
+                 "discord": {"enabled": enabled_value},
+                 "platforms": {"discord": {"enabled": True}},
+             }):
+            args = MagicMock()
+            args.json = True
+            args.plain = False
+            args.no_bundled = False
+            args.user = False
+            args.enabled = False
+
+            cmd_list(args)
+            captured = capsys.readouterr()
+            payload = json.loads(captured.out)
+            assert payload[0]["name"] == "discord-platform"
+            assert payload[0]["status"] == "disabled"
+
+    @patch("hermes_cli.plugins.get_bundled_plugins_dir")
+    @patch("hermes_cli.plugins_cmd._plugins_dir")
+    def test_json_status_uses_manifest_gateway_key_for_bundled_platform(
+        self, mock_user_dir, mock_bundled_dir, tmp_path, capsys
+    ):
+        from hermes_cli.plugins_cmd import cmd_list
+
+        bundled_dir = tmp_path / "bundled"
+        _make_category_plugin(
+            bundled_dir,
+            "platforms",
+            "directory-name",
+            {
+                "name": "custom-platform",
+                "gateway_key": "custom_gateway",
+                "kind": "platform",
+                "version": "1.0.0",
+            },
+        )
+        user_dir = tmp_path / "user"
+        user_dir.mkdir()
+        mock_user_dir.return_value = user_dir
+        mock_bundled_dir.return_value = bundled_dir
+
+        with patch("hermes_cli.plugins_cmd._get_enabled_set", return_value=set()), \
+             patch("hermes_cli.plugins_cmd._get_disabled_set", return_value=set()), \
+             patch("hermes_cli.plugins_cmd._load_status_config", return_value={
+                 "platforms": {"custom_gateway": {"enabled": False}},
+             }):
+            args = MagicMock()
+            args.json = True
+            args.plain = False
+            args.no_bundled = False
+            args.user = False
+            args.enabled = False
+
+            cmd_list(args)
+            captured = capsys.readouterr()
+            payload = json.loads(captured.out)
+            assert payload[0]["name"] == "custom-platform"
+            assert payload[0]["status"] == "disabled"

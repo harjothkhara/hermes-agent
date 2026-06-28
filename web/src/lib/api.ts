@@ -2262,10 +2262,12 @@ export interface PluginManifestResponse {
 
 export interface HubAgentPluginRow {
   name: string;
+  key: string;
   version: string;
   description: string;
   source: string;
   runtime_status: "disabled" | "enabled" | "inactive";
+  runtime_toggleable?: boolean;
   has_dashboard_manifest: boolean;
   dashboard_manifest: PluginManifestResponse | null;
   path: string;

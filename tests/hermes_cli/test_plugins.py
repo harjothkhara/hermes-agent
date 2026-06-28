@@ -534,6 +534,151 @@ class TestPluginLoading:
         assert not mgr._plugins["no_reg"].enabled
         assert "no register()" in mgr._plugins["no_reg"].error
 
+    @pytest.mark.parametrize(
+        "disabled_entry",
+        ["discord-platform", "discord", "platforms/discord"],
+    )
+    def test_bundled_platform_ignores_stale_disabled_config(
+        self, tmp_path, monkeypatch, caplog, disabled_entry
+    ):
+        """Bundled gateway adapters must not be hidden by old plugins.disabled rows."""
+        bundled_plugins = tmp_path / "bundled"
+        platform_dir = bundled_plugins / "platforms" / "discord"
+        platform_dir.mkdir(parents=True)
+        (platform_dir / "plugin.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "name": "discord-platform",
+                    "kind": "platform",
+                    "version": "0.1.0",
+                    "description": "Test Discord platform",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (platform_dir / "__init__.py").write_text(
+            "def register(ctx):\n"
+            "    ctx.register_platform(\n"
+            "        name='discord',\n"
+            "        label='Discord',\n"
+            "        adapter_factory=lambda config: object(),\n"
+            "        check_fn=lambda: True,\n"
+            "    )\n",
+            encoding="utf-8",
+        )
+
+        hermes_home = tmp_path / "hermes_test"
+        hermes_home.mkdir(exist_ok=True)
+        (hermes_home / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "plugins": {
+                        "disabled": [disabled_entry],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_BUNDLED_PLUGINS", str(bundled_plugins))
+
+        from gateway.platform_registry import platform_registry
+
+        caplog.set_level(logging.WARNING, logger="hermes_cli.plugins")
+        platform_registry._entries.clear()
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        loaded = mgr._plugins["discord-platform"]
+        assert loaded.enabled
+        assert loaded.error is None
+        assert platform_registry.get("discord") is not None
+        assert "Ignoring stale plugins.disabled entry" in caplog.text
+
+    def test_bundled_backend_still_respects_disabled_config(self, tmp_path, monkeypatch):
+        """Bundled backends stay suppressible through plugins.disabled."""
+        bundled_plugins = tmp_path / "bundled"
+        backend_dir = bundled_plugins / "image_gen" / "mock_backend"
+        backend_dir.mkdir(parents=True)
+        (backend_dir / "plugin.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "name": "mock_backend",
+                    "kind": "backend",
+                    "version": "0.1.0",
+                    "description": "Test backend",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (backend_dir / "__init__.py").write_text(
+            "def register(ctx):\n    pass\n",
+            encoding="utf-8",
+        )
+
+        hermes_home = tmp_path / "hermes_test"
+        hermes_home.mkdir(exist_ok=True)
+        (hermes_home / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "plugins": {
+                        "enabled": ["image_gen/mock_backend"],
+                        "disabled": ["image_gen/mock_backend"],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_BUNDLED_PLUGINS", str(bundled_plugins))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        loaded = mgr._plugins["image_gen/mock_backend"]
+        assert not loaded.enabled
+        assert loaded.error == "disabled via config"
+
+    def test_user_platform_still_respects_disabled_config(self, tmp_path, monkeypatch):
+        """User-installed platform plugins still obey plugins.disabled."""
+        hermes_home = tmp_path / "hermes_test"
+        plugin_dir = hermes_home / "plugins" / "my_platform"
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "plugin.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "name": "my_platform",
+                    "kind": "platform",
+                    "version": "0.1.0",
+                    "description": "User platform",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (plugin_dir / "__init__.py").write_text(
+            "def register(ctx):\n    pass\n",
+            encoding="utf-8",
+        )
+        (hermes_home / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "plugins": {
+                        "enabled": ["my_platform"],
+                        "disabled": ["my_platform"],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        loaded = mgr._plugins["my_platform"]
+        assert not loaded.enabled
+        assert loaded.error == "disabled via config"
+
     def test_load_registers_namespace_module(self, tmp_path, monkeypatch):
         """Directory plugins are importable under hermes_plugins.<name>."""
         plugins_dir = tmp_path / "hermes_test" / "plugins"

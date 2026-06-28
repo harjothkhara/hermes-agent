@@ -12985,6 +12985,12 @@ _dashboard_plugins_cache: Optional[list] = None
 def _get_dashboard_plugins(force_rescan: bool = False) -> list:
     global _dashboard_plugins_cache
     if _dashboard_plugins_cache is None or force_rescan:
+        if force_rescan:
+            try:
+                from hermes_cli.plugins_cmd import _read_manifest
+                _read_manifest.cache_clear()
+            except Exception:
+                pass
         _dashboard_plugins_cache = _discover_dashboard_plugins()
     elif _dashboard_plugins_cache:
         if any(not Path(p["_dir"]).is_dir() for p in _dashboard_plugins_cache):
@@ -13034,6 +13040,8 @@ def _merged_plugins_hub() -> Dict[str, Any]:
         _discover_memory_providers,
         _get_disabled_set,
         _get_enabled_set,
+        _entry_status,
+        _is_bundled_platform_entry,
         _read_manifest as _read_plugin_manifest_at,
     )
 
@@ -13050,19 +13058,12 @@ def _merged_plugins_hub() -> Dict[str, Any]:
     plugins_root_resolved = (get_hermes_home() / "plugins").resolve()
     rows: List[Dict[str, Any]] = []
 
-    for name, version, description, source, dir_str, key in _discover_all_plugins():
-        # Both the path-derived key (nested category plugins) and the bare
-        # manifest name count for enabled/disabled state, matching the runtime
-        # loader's back-compat lookup.
-        aliases = {name}
-        if key:
-            aliases.add(key)
-        if aliases & disabled_set:
-            runtime_status = "disabled"
-        elif aliases & enabled_set:
-            runtime_status = "enabled"
-        else:
-            runtime_status = "inactive"
+    for plugin_entry in _discover_all_plugins():
+        name, version, description, source, dir_str, key = plugin_entry
+        status_name = _entry_status(plugin_entry, enabled_set, disabled_set, config)
+        runtime_status = "inactive" if status_name == "not enabled" else status_name
+        is_bundled_platform = _is_bundled_platform_entry(plugin_entry)
+        runtime_toggleable = not is_bundled_platform
 
         dir_path = Path(dir_str)
         dm = dash_by_name.get(name)
@@ -13088,8 +13089,8 @@ def _merged_plugins_hub() -> Dict[str, Any]:
             try:
                 from tools.registry import registry
                 for tname in provides_tools:
-                    entry = registry.get_entry(tname)
-                    if entry and entry.check_fn and not entry.check_fn():
+                    tool_entry = registry.get_entry(tname)
+                    if tool_entry and tool_entry.check_fn and not tool_entry.check_fn():
                         auth_required = True
                         auth_command = f"hermes auth {name}"
                         break
@@ -13098,10 +13099,12 @@ def _merged_plugins_hub() -> Dict[str, Any]:
 
         rows.append({
             "name": name,
+            "key": key,
             "version": version or "",
             "description": description or "",
             "source": source,
             "runtime_status": runtime_status,
+            "runtime_toggleable": runtime_toggleable,
             "has_dashboard_manifest": has_dash_manifest,
             "dashboard_manifest": _strip_dashboard_manifest(dm) if dm else None,
             "path": dir_str,

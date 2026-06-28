@@ -4,6 +4,8 @@ import logging
 import os
 from unittest.mock import patch
 
+import pytest
+
 from gateway.config import (
     GatewayConfig,
     HomeChannel,
@@ -134,6 +136,82 @@ class TestGetConnectedPlatforms:
             },
         )
         assert Platform.DINGTALK not in config.get_connected_platforms()
+
+
+class TestEnvOverrides:
+    @pytest.mark.parametrize(
+        ("platform", "env"),
+        [
+            (Platform.HOMEASSISTANT, {"HASS_TOKEN": "token"}),
+            (
+                Platform.DINGTALK,
+                {"DINGTALK_CLIENT_ID": "client", "DINGTALK_CLIENT_SECRET": "secret"},
+            ),
+            (
+                Platform.FEISHU,
+                {"FEISHU_APP_ID": "app", "FEISHU_APP_SECRET": "secret"},
+            ),
+            (
+                Platform.EMAIL,
+                {
+                    "EMAIL_ADDRESS": "bot@example.com",
+                    "EMAIL_PASSWORD": "secret",
+                    "EMAIL_IMAP_HOST": "imap.example.com",
+                    "EMAIL_SMTP_HOST": "smtp.example.com",
+                },
+            ),
+            (
+                Platform.SMS,
+                {"TWILIO_ACCOUNT_SID": "sid", "TWILIO_AUTH_TOKEN": "token"},
+            ),
+            (
+                Platform.WHATSAPP_CLOUD,
+                {
+                    "WHATSAPP_CLOUD_PHONE_NUMBER_ID": "phone",
+                    "WHATSAPP_CLOUD_ACCESS_TOKEN": "token",
+                },
+            ),
+            (
+                Platform.API_SERVER,
+                {"API_SERVER_KEY": "secret"},
+            ),
+            (
+                Platform.WEIXIN,
+                {"WEIXIN_TOKEN": "token"},
+            ),
+            (
+                Platform.BLUEBUBBLES,
+                {
+                    "BLUEBUBBLES_SERVER_URL": "https://bluebubbles.example",
+                    "BLUEBUBBLES_PASSWORD": "secret",
+                },
+            ),
+            (
+                Platform.QQBOT,
+                {"QQ_APP_ID": "app"},
+            ),
+            (
+                Platform.YUANBAO,
+                {"YUANBAO_APP_ID": "app", "YUANBAO_APP_SECRET": "secret"},
+            ),
+        ],
+    )
+    def test_env_credentials_do_not_override_explicit_disabled_platforms(
+        self, platform, env
+    ):
+        config = GatewayConfig(
+            platforms={
+                platform: PlatformConfig(
+                    enabled=False,
+                    extra={"_enabled_explicit": True},
+                )
+            }
+        )
+
+        with patch.dict(os.environ, env, clear=True):
+            _apply_env_overrides(config)
+
+        assert config.platforms[platform].enabled is False
 
 
 class TestSessionResetPolicy:

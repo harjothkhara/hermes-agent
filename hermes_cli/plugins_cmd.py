@@ -10,6 +10,7 @@ rendered with Rich Markdown.  Otherwise a default confirmation is shown.
 from __future__ import annotations
 
 import functools
+import importlib.metadata
 import json
 import logging
 import os
@@ -20,7 +21,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from hermes_constants import get_hermes_home
-from hermes_cli.config import cfg_get
+from hermes_cli.config import cfg_get, _project_plugins_enabled
 from hermes_cli.secret_prompt import masked_secret_prompt
 
 logger = logging.getLogger(__name__)
@@ -259,9 +260,12 @@ def _repo_name_from_url(url: str) -> str:
     return name
 
 
+@functools.lru_cache(maxsize=256)
 def _read_manifest(plugin_dir: Path) -> dict:
     """Read plugin.yaml and return the parsed dict, or empty dict."""
     manifest_file = plugin_dir / "plugin.yaml"
+    if not manifest_file.exists():
+        manifest_file = plugin_dir / "plugin.yml"
     if not manifest_file.exists():
         return {}
     try:
@@ -530,6 +534,7 @@ def _install_plugin_core(identifier: str, *, force: bool) -> tuple[Path, dict, s
             shutil.rmtree(target)
 
         shutil.move(str(tmp_target), str(target))
+        _read_manifest.cache_clear()
 
     has_yaml = (target / "plugin.yaml").exists() or (target / "plugin.yml").exists()
     if not has_yaml and not (target / "__init__.py").exists():
@@ -658,6 +663,7 @@ def cmd_update(name: str) -> None:
     if not ok:
         console.print(f"[red]Error:[/red] {output}")
         sys.exit(1)
+    _read_manifest.cache_clear()
 
     # Copy any new .example files
     _copy_example_files(target, console)
@@ -686,6 +692,7 @@ def cmd_remove(name: str) -> None:
         sys.exit(1)
 
     shutil.rmtree(target)
+    _read_manifest.cache_clear()
     _display_removed(name, plugins_dir)
 
 
@@ -693,7 +700,9 @@ def _get_disabled_set() -> set:
     """Read the disabled plugins set from config.yaml.
 
     An explicit deny-list. A plugin name here never loads, even if also
-    listed in ``plugins.enabled``.
+    listed in ``plugins.enabled``. Bundled platform adapters are the runtime
+    exception: they are registered as gateway inventory and channel activation
+    is controlled by ``gateway.platforms.<name>.enabled``.
     """
     try:
         from hermes_cli.config import load_config
@@ -742,6 +751,27 @@ def _save_enabled_set(enabled: set) -> None:
     save_config(config)
 
 
+def _resolve_plugin_entry(name: str) -> Optional[tuple]:
+    """Resolve a user-supplied plugin identifier to a discovered entry."""
+    entries = _discover_all_plugins()
+    # 1. Exact match on canonical key or manifest name - always unambiguous.
+    for entry in entries:
+        # entry = (name, version, description, source, dir_path, key)
+        if name == entry[5] or name == entry[0]:
+            return entry
+    # 2. Fall back to a bare leaf-name match (e.g. "nemo_relay" ->
+    #    "observability/nemo_relay"), but only when it resolves to exactly one
+    #    plugin so we never silently pick the wrong same-named nested plugin.
+    alias_matches = [
+        entry
+        for entry in entries
+        if name in _plugin_config_aliases_for_entry(entry)
+    ]
+    if len(alias_matches) == 1:
+        return alias_matches[0]
+    return None
+
+
 def _resolve_plugin_key(name: str) -> Optional[str]:
     """Resolve a user-supplied plugin identifier to its canonical registry key.
 
@@ -754,19 +784,133 @@ def _resolve_plugin_key(name: str) -> Optional[str]:
     ``disable`` write the same key that ``PluginManager`` matches against —
     nested category plugins (e.g. ``observability/nemo_relay``) included.
     """
-    entries = _discover_all_plugins()
-    # 1. Exact match on canonical key or manifest name — always unambiguous.
-    for entry in entries:
-        # entry = (name, version, description, source, dir_path, key)
-        if name == entry[5] or name == entry[0]:
-            return entry[5]
-    # 2. Fall back to a bare leaf-name match (e.g. "nemo_relay" ->
-    #    "observability/nemo_relay"), but only when it resolves to exactly one
-    #    plugin so we never silently pick the wrong same-named nested plugin.
-    leaf_matches = [entry[5] for entry in entries if name == entry[5].split("/")[-1]]
-    if len(leaf_matches) == 1:
-        return leaf_matches[0]
-    return None
+    entry = _resolve_plugin_entry(name)
+    return entry[5] if entry is not None else None
+
+
+def _plugin_config_aliases(name: str, key: str) -> set[str]:
+    """Return config spellings accepted for a plugin."""
+    aliases = {name}
+    if key:
+        aliases.add(key)
+        aliases.add(key.split("/")[-1])
+    return aliases
+
+
+def _is_bundled_platform_entry(entry: tuple) -> bool:
+    """Return True for repo-shipped gateway platform plugin entries."""
+    _name, _version, _description, source, dir_path, _key = entry
+    if source != "bundled":
+        return False
+    return _read_manifest(Path(dir_path)).get("kind") == "platform"
+
+
+def _bundled_platform_config_keys(entry: tuple) -> tuple[str, ...]:
+    """Best-effort gateway platform keys for bundled platform config guidance."""
+    _name, _version, _description, _source, dir_path, _key = entry
+    manifest = _read_manifest(Path(dir_path))
+    keys: list[str] = []
+
+    def _add(value: Any) -> None:
+        if not isinstance(value, str) or not value.strip():
+            return
+        key = value.strip()
+        if key not in keys:
+            keys.append(key)
+
+    for scalar_key in ("gateway_key", "platform_key", "id"):
+        _add(manifest.get(scalar_key))
+    for list_key in ("gateway_keys", "platform_keys"):
+        values = manifest.get(list_key)
+        if isinstance(values, list):
+            for value in values:
+                _add(value)
+    if not keys:
+        _add(Path(dir_path).name)
+    return tuple(keys)
+
+
+def _bundled_platform_disable_error(entry: tuple) -> str:
+    name = entry[0]
+    platforms = _bundled_platform_config_keys(entry)
+    if len(platforms) == 1:
+        action = "Disable the channel with"
+        config_hint = (
+            f"platforms.{platforms[0]}.enabled: false "
+            f"(or gateway.platforms.{platforms[0]}.enabled: false)"
+        )
+    else:
+        action = "Disable channels with"
+        config_hint = ", ".join(
+            f"platforms.{platform}.enabled: false "
+            f"(or gateway.platforms.{platform}.enabled: false)"
+            for platform in platforms
+        )
+    return (
+        f"Bundled platform plugin '{name}' is registered automatically. "
+        f"{action} {config_hint}."
+    )
+
+
+def _bundled_platform_config_hint(entry: tuple) -> str:
+    platforms = _bundled_platform_config_keys(entry)
+    if len(platforms) == 1:
+        return (
+            f"platforms.{platforms[0]}.enabled "
+            f"(or gateway.platforms.{platforms[0]}.enabled)"
+        )
+    return ", ".join(
+        f"platforms.{platform}.enabled "
+        f"(or gateway.platforms.{platform}.enabled)"
+        for platform in platforms
+    )
+
+
+def _plugin_config_aliases_for_entry(entry: tuple) -> set[str]:
+    """Return config spellings accepted for a discovered plugin entry."""
+    name, _version, _description, _source, _dir, key = entry
+    aliases = _plugin_config_aliases(name, key)
+    if _is_bundled_platform_entry(entry):
+        for platform in _bundled_platform_config_keys(entry):
+            aliases.add(platform)
+            aliases.add(f"platforms/{platform}")
+        _name, _version, _description, _source, dir_path, _key = entry
+        platform_dir = Path(dir_path).name
+        aliases.add(platform_dir)
+        aliases.add(f"platforms/{platform_dir}")
+    return aliases
+
+
+def _non_bundled_plugin_config_aliases() -> set[str]:
+    """Return disabled-list aliases claimed by real non-platform-inventory plugins."""
+    aliases: set[str] = set()
+    for entry in _discover_all_plugins():
+        if _is_bundled_platform_entry(entry):
+            continue
+        aliases.update(_plugin_config_aliases_for_entry(entry))
+    try:
+        eps = importlib.metadata.entry_points()
+        if hasattr(eps, "select"):
+            group_eps = eps.select(group="hermes_agent.plugins")
+        elif isinstance(eps, dict):
+            group_eps = eps.get("hermes_agent.plugins", [])
+        else:
+            group_eps = [ep for ep in eps if ep.group == "hermes_agent.plugins"]
+        for ep in group_eps:
+            if isinstance(ep.name, str) and ep.name.strip():
+                aliases.add(ep.name.strip())
+    except Exception:
+        pass
+    return aliases
+
+
+def _removable_bundled_platform_disabled_aliases(
+    entry: tuple,
+    disabled: set[str],
+) -> set[str]:
+    aliases = _plugin_config_aliases_for_entry(entry)
+    claimed = _non_bundled_plugin_config_aliases()
+    return (aliases & disabled) - claimed
 
 
 def cmd_enable(name: str) -> None:
@@ -776,20 +920,43 @@ def cmd_enable(name: str) -> None:
     console = Console()
     # Discover the plugin — check installed (user) AND bundled, including
     # nested category plugins — and normalize to its canonical registry key.
-    key = _resolve_plugin_key(name)
-    if key is None:
+    entry = _resolve_plugin_entry(name)
+    if entry is None:
         console.print(f"[red]Plugin '{name}' is not installed or bundled.[/red]")
         sys.exit(1)
+    key = entry[5]
 
     enabled = _get_enabled_set()
     disabled = _get_disabled_set()
 
-    if key in enabled and key not in disabled:
+    if _is_bundled_platform_entry(entry):
+        stale_disabled = _removable_bundled_platform_disabled_aliases(entry, disabled)
+        if stale_disabled:
+            for alias in stale_disabled:
+                disabled.discard(alias)
+            _save_disabled_set(disabled)
+            console.print(
+                f"[green]✓[/green] Removed stale disabled config for bundled "
+                f"platform [bold]{key}[/bold]. "
+                f"Use {_bundled_platform_config_hint(entry)} "
+                "to activate or deactivate the channel."
+            )
+            return
+        console.print(
+            f"[dim]Bundled platform plugin '{key}' is registered automatically. "
+            f"Use {_bundled_platform_config_hint(entry)} "
+            "to activate or deactivate the channel.[/dim]"
+        )
+        return
+
+    aliases = _plugin_config_aliases_for_entry(entry)
+    if key in enabled and not (aliases & disabled):
         console.print(f"[dim]Plugin '{key}' is already enabled.[/dim]")
         return
 
     enabled.add(key)
-    disabled.discard(key)
+    for alias in aliases:
+        disabled.discard(alias)
     # Drop any legacy bare-name entry so the two don't drift out of sync.
     bare = key.split("/")[-1]
     if bare != key:
@@ -807,24 +974,31 @@ def cmd_disable(name: str) -> None:
     from rich.console import Console
 
     console = Console()
-    key = _resolve_plugin_key(name)
-    if key is None:
+    entry = _resolve_plugin_entry(name)
+    if entry is None:
         console.print(f"[red]Plugin '{name}' is not installed or bundled.[/red]")
+        sys.exit(1)
+    key = entry[5]
+
+    if _is_bundled_platform_entry(entry):
+        console.print(f"[red]Error:[/red] {_bundled_platform_disable_error(entry)}")
         sys.exit(1)
 
     enabled = _get_enabled_set()
     disabled = _get_disabled_set()
+    aliases = _plugin_config_aliases_for_entry(entry)
+    stale_disabled_aliases = (aliases - {key}) & disabled
 
-    if key not in enabled and key in disabled:
+    if key not in enabled and key in disabled and not stale_disabled_aliases:
         console.print(f"[dim]Plugin '{key}' is already disabled.[/dim]")
         return
 
     enabled.discard(key)
     # Drop any legacy bare-name entry from the allow-list too, so a stale
     # bare name can't keep a nested plugin loading after an explicit disable.
-    bare = key.split("/")[-1]
-    if bare != key:
-        enabled.discard(bare)
+    for alias in aliases:
+        enabled.discard(alias)
+        disabled.discard(alias)
     disabled.add(key)
     _save_enabled_set(enabled)
     _save_disabled_set(disabled)
@@ -912,20 +1086,34 @@ def _discover_all_plugins() -> list:
     bundled first, then user, then project; user overrides bundled on
     key collision.
     """
+    _read_manifest.cache_clear()
     seen: dict = {}  # key -> (name, version, description, source, path, key)
 
-    # Bundled (<repo>/plugins/<name>/), excluding memory/ and context_engine/
+    # Bundled (<repo>/plugins/<name>/), plus platform adapters from their
+    # dedicated root so their manifest names match the runtime loader.
     from hermes_cli.plugins import get_bundled_plugins_dir
     repo_plugins = get_bundled_plugins_dir()
     for base, source, skip in (
-        (repo_plugins, "bundled", {"memory", "context_engine"}),
+        (
+            repo_plugins,
+            "bundled",
+            {"memory", "context_engine", "platforms", "model-providers"},
+        ),
+        (repo_plugins / "platforms", "bundled", set()),
         (_plugins_dir(), "user", set()),
     ):
         _scan_level(base, source, skip, "", 0, seen)
+    if _project_plugins_enabled():
+        _scan_level(Path.cwd() / ".hermes" / "plugins", "project", set(), "", 0, seen)
     return list(seen.values())
 
 
-def _plugin_status(name: str, enabled: set, disabled: set, key: str = "") -> str:
+def _plugin_status(
+    name: str,
+    enabled: set,
+    disabled: set,
+    key: str = "",
+) -> str:
     """Return the user-facing activation state for a plugin name or key."""
     if name in disabled or key in disabled:
         return "disabled"
@@ -934,7 +1122,74 @@ def _plugin_status(name: str, enabled: set, disabled: set, key: str = "") -> str
     return "not enabled"
 
 
-def _filter_plugin_entries(entries: list, args: Any, enabled: set, disabled: set) -> list:
+def _gateway_platform_disabled(entry: tuple, config: dict | None) -> bool:
+    if not config or not _is_bundled_platform_entry(entry):
+        return False
+
+    def _coerce_enabled(value: Any) -> Optional[bool]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"true", "1", "yes", "on"}:
+                return True
+            if lowered in {"false", "0", "no", "off"}:
+                return False
+            # Match PlatformConfig.from_dict(default=False): unknown strings disable.
+            return False
+        return bool(value)
+
+    states = []
+    for platform in _bundled_platform_config_keys(entry):
+        gateway_enabled = cfg_get(
+            config, "gateway", "platforms", platform, "enabled", default=None
+        )
+        top_level_enabled = cfg_get(
+            config, "platforms", platform, "enabled", default=None
+        )
+        direct_enabled = cfg_get(config, platform, "enabled", default=None)
+        if direct_enabled is not None:
+            effective_enabled = direct_enabled
+        elif top_level_enabled is not None:
+            effective_enabled = top_level_enabled
+        else:
+            effective_enabled = gateway_enabled
+        states.append(_coerce_enabled(effective_enabled))
+    return bool(states) and all(state is False for state in states)
+
+
+def _entry_status(
+    entry: tuple,
+    enabled: set,
+    disabled: set,
+    config: dict | None = None,
+) -> str:
+    """Return the list/dashboard runtime status for a discovered plugin entry."""
+    name, _version, _description, _source, _dir, key = entry
+    if _is_bundled_platform_entry(entry):
+        if _gateway_platform_disabled(entry, config):
+            return "disabled"
+        return "enabled"
+    return _plugin_status(name, enabled, disabled, key=key)
+
+
+def _load_status_config() -> dict:
+    try:
+        from hermes_cli.config import load_config
+        return load_config()
+    except Exception:
+        return {}
+
+
+def _filter_plugin_entries(
+    entries: list,
+    args: Any,
+    enabled: set,
+    disabled: set,
+    config: dict | None = None,
+) -> list:
     """Apply ``hermes plugins list`` CLI filters."""
     filtered = entries
     if getattr(args, "no_bundled", False) or getattr(args, "user", False):
@@ -942,7 +1197,7 @@ def _filter_plugin_entries(entries: list, args: Any, enabled: set, disabled: set
     if getattr(args, "enabled", False):
         filtered = [
             entry for entry in filtered
-            if _plugin_status(entry[0], enabled, disabled, key=entry[5]) == "enabled"
+            if _entry_status(entry, enabled, disabled, config) == "enabled"
         ]
     return filtered
 
@@ -961,25 +1216,28 @@ def cmd_list(args: Any | None = None) -> None:
 
     enabled = _get_enabled_set()
     disabled = _get_disabled_set()
-    entries = _filter_plugin_entries(entries, args, enabled, disabled)
+    status_config = _load_status_config()
+    entries = _filter_plugin_entries(entries, args, enabled, disabled, status_config)
 
     if getattr(args, "json", False):
         payload = [
             {
                 "name": name,
-                "status": _plugin_status(name, enabled, disabled, key=key),
+                "status": _entry_status(entry, enabled, disabled, status_config),
                 "version": str(version),
                 "description": description,
                 "source": source,
             }
-            for name, version, description, source, _dir, key in entries
+            for entry in entries
+            for name, version, description, source, _dir, key in [entry]
         ]
         print(json.dumps(payload, indent=2))
         return
 
     if getattr(args, "plain", False):
-        for name, version, _description, source, _dir, key in entries:
-            status = _plugin_status(name, enabled, disabled, key=key)
+        for entry in entries:
+            name, version, _description, source, _dir, key = entry
+            status = _entry_status(entry, enabled, disabled, status_config)
             print(f"{status:12} {source:8} {str(version):8} {name}")
         return
 
@@ -994,8 +1252,9 @@ def cmd_list(args: Any | None = None) -> None:
     table.add_column("Description")
     table.add_column("Source", style="dim")
 
-    for name, version, description, source, _dir, key in entries:
-        status_name = _plugin_status(name, enabled, disabled, key=key)
+    for entry in entries:
+        name, version, description, source, _dir, key = entry
+        status_name = _entry_status(entry, enabled, disabled, status_config)
         if status_name == "disabled":
             status = "[red]disabled[/red]"
         elif status_name == "enabled":
@@ -1194,15 +1453,23 @@ def cmd_toggle() -> None:
     plugin_names = []
     plugin_labels = []
     plugin_selected = set()
+    non_toggleable_aliases: set[str] = set()
 
-    for i, (name, _version, description, source, _d, key) in enumerate(entries):
+    for entry in entries:
+        name, _version, description, source, _d, key = entry
+        if _is_bundled_platform_entry(entry):
+            non_toggleable_aliases.update(_plugin_config_aliases_for_entry(entry))
+            continue
+
         label = f"{name} \u2014 {description}" if description else name
         if source == "bundled":
             label = f"{label} [bundled]"
-        plugin_names.append(name)
+        i = len(plugin_names)
+        plugin_names.append(key)
         plugin_labels.append(label)
+        aliases = _plugin_config_aliases_for_entry(entry)
         # Selected (enabled) when in enabled-set AND not in disabled-set
-        if (name in enabled_set or key in enabled_set) and name not in disabled_set and key not in disabled_set:
+        if aliases & enabled_set and not (aliases & disabled_set):
             plugin_selected.add(i)
 
     # -- Provider categories --
@@ -1230,14 +1497,14 @@ def cmd_toggle() -> None:
     try:
         import curses
         _run_composite_ui(curses, plugin_names, plugin_labels, plugin_selected,
-                          disabled_set, categories, console)
+                          disabled_set, categories, console, non_toggleable_aliases)
     except ImportError:
         _run_composite_fallback(plugin_names, plugin_labels, plugin_selected,
-                                disabled_set, categories, console)
+                                disabled_set, categories, console, non_toggleable_aliases)
 
 
 def _run_composite_ui(curses, plugin_names, plugin_labels, plugin_selected,
-                      disabled, categories, console):
+                      disabled, categories, console, non_toggleable_aliases=None):
     """Custom curses screen with checkboxes + category action rows."""
     from hermes_cli.curses_ui import flush_stdin
 
@@ -1461,8 +1728,11 @@ def _run_composite_ui(curses, plugin_names, plugin_labels, plugin_selected,
     # plugin names that were checked; anything not checked is explicitly
     # disabled (written to disabled-list) so it remains off even if the
     # plugin code does something clever like auto-enable in the future.
-    new_enabled: set = set()
-    new_disabled: set = set(disabled)  # preserve existing disabled state for unseen plugins
+    prev_enabled = _get_enabled_set()
+    new_enabled: set = set(prev_enabled) if not plugin_names else set()
+    non_toggleable_aliases = non_toggleable_aliases or set()
+    removed_stale_aliases = set(disabled) & non_toggleable_aliases
+    new_disabled: set = set(disabled) - non_toggleable_aliases
     for i, name in enumerate(plugin_names):
         if i in chosen:
             new_enabled.add(name)
@@ -1470,17 +1740,24 @@ def _run_composite_ui(curses, plugin_names, plugin_labels, plugin_selected,
         else:
             new_disabled.add(name)
 
-    prev_enabled = _get_enabled_set()
     enabled_changed = new_enabled != prev_enabled
     disabled_changed = new_disabled != disabled
 
     if enabled_changed or disabled_changed:
         _save_enabled_set(new_enabled)
         _save_disabled_set(new_disabled)
-        console.print(
-            f"\n[green]\u2713[/green] General plugins: {len(new_enabled)} enabled, "
-            f"{len(plugin_names) - len(new_enabled)} disabled."
-        )
+        if removed_stale_aliases and not enabled_changed and new_disabled == (
+            set(disabled) - removed_stale_aliases
+        ):
+            console.print(
+                "\n[green]\u2713[/green] Cleaned up stale bundled platform "
+                "entries from plugins.disabled."
+            )
+        else:
+            console.print(
+                f"\n[green]\u2713[/green] General plugins: {len(new_enabled)} enabled, "
+                f"{len(plugin_names) - len(new_enabled)} disabled."
+            )
     elif n_plugins > 0:
         console.print("\n[dim]General plugins unchanged.[/dim]")
 
@@ -1498,15 +1775,21 @@ def _run_composite_ui(curses, plugin_names, plugin_labels, plugin_selected,
 
 
 def _run_composite_fallback(plugin_names, plugin_labels, plugin_selected,
-                            disabled, categories, console):
+                            disabled, categories, console, non_toggleable_aliases=None):
     """Text-based fallback for the composite plugins UI."""
     from hermes_cli.colors import Colors, color
 
     print(color("\n  Plugins", Colors.YELLOW))
 
     # General plugins
+    prev_enabled = _get_enabled_set()
+    chosen = set(plugin_selected)
+    non_toggleable_aliases = non_toggleable_aliases or set()
+    removed_stale_aliases = set(disabled) & non_toggleable_aliases
+    new_enabled: set = set(prev_enabled) if not plugin_names else set()
+    new_disabled: set = set(disabled) - non_toggleable_aliases
+
     if plugin_names:
-        chosen = set(plugin_selected)
         print(color("\n  General Plugins", Colors.YELLOW))
         print(color("  Toggle by number, Enter to confirm.\n", Colors.DIM))
 
@@ -1526,18 +1809,25 @@ def _run_composite_fallback(plugin_names, plugin_labels, plugin_selected,
                 return
             print()
 
-        new_enabled: set = set()
-        new_disabled: set = set(disabled)
         for i, name in enumerate(plugin_names):
             if i in chosen:
                 new_enabled.add(name)
                 new_disabled.discard(name)
             else:
                 new_disabled.add(name)
-        prev_enabled = _get_enabled_set()
-        if new_enabled != prev_enabled or new_disabled != disabled:
-            _save_enabled_set(new_enabled)
-            _save_disabled_set(new_disabled)
+
+    if new_enabled != prev_enabled or new_disabled != disabled:
+        _save_enabled_set(new_enabled)
+        _save_disabled_set(new_disabled)
+        if removed_stale_aliases and new_enabled == prev_enabled and new_disabled == (
+            set(disabled) - removed_stale_aliases
+        ):
+            print(
+                color(
+                    "  Cleaned up stale bundled platform entries from plugins.disabled.",
+                    Colors.GREEN,
+                )
+            )
 
     # Provider categories
     if categories:
@@ -1696,31 +1986,60 @@ def dashboard_set_agent_plugin_enabled(name: str, *, enabled: bool) -> dict[str,
     For plugins that provide tools (toolsets), also toggles the toolset in
     ``platform_toolsets`` so the agent actually sees the tools in sessions.
     """
-    if not _plugin_exists(name):
+    entry = _resolve_plugin_entry(name)
+    if entry is None:
         return {"ok": False, "error": f"Plugin '{name}' is not installed or bundled."}
+    key = entry[5]
 
     en = _get_enabled_set()
     dis = _get_disabled_set()
 
+    if _is_bundled_platform_entry(entry):
+        if enabled:
+            stale_disabled = _removable_bundled_platform_disabled_aliases(entry, dis)
+            if stale_disabled:
+                for alias in stale_disabled:
+                    dis.discard(alias)
+                _save_disabled_set(dis)
+                return {"ok": True, "name": key, "unchanged": False}
+            hint = _bundled_platform_config_hint(entry)
+            return {
+                "ok": False,
+                "name": key,
+                "reason": "channel_config_required",
+                "error": (
+                    f"Bundled platform plugin '{entry[0]}' is registered "
+                    f"automatically. Configure it with {hint} in config.yaml."
+                ),
+                "hint": hint,
+            }
+        return {"ok": False, "error": _bundled_platform_disable_error(entry)}
+
+    aliases = _plugin_config_aliases_for_entry(entry)
     if enabled:
-        if name in en and name not in dis:
-            return {"ok": True, "name": name, "unchanged": True}
-        en.add(name)
-        dis.discard(name)
+        if key in en and not (aliases & dis):
+            return {"ok": True, "name": key, "unchanged": True}
+        en.add(key)
+        for alias in aliases:
+            dis.discard(alias)
         _save_enabled_set(en)
         _save_disabled_set(dis)
-        _toggle_plugin_toolset(name, enable=True)
-        return {"ok": True, "name": name, "unchanged": False}
+        _toggle_plugin_toolset(key, enable=True)
+        return {"ok": True, "name": key, "unchanged": False}
 
-    if name not in en and name in dis:
-        return {"ok": True, "name": name, "unchanged": True}
+    stale_disabled_aliases = (aliases - {key}) & dis
+    if key not in en and key in dis and not stale_disabled_aliases:
+        return {"ok": True, "name": key, "unchanged": True}
 
-    en.discard(name)
-    dis.add(name)
+    en.discard(key)
+    for alias in aliases:
+        en.discard(alias)
+        dis.discard(alias)
+    dis.add(key)
     _save_enabled_set(en)
     _save_disabled_set(dis)
-    _toggle_plugin_toolset(name, enable=False)
-    return {"ok": True, "name": name, "unchanged": False}
+    _toggle_plugin_toolset(key, enable=False)
+    return {"ok": True, "name": key, "unchanged": False}
 
 
 def _user_installed_plugin_dir(name: str) -> Optional[Path]:
@@ -1751,6 +2070,7 @@ def dashboard_update_user_plugin(name: str) -> dict[str, Any]:
     ok, msg = _git_pull_plugin_dir(target)
     if not ok:
         return {"ok": False, "error": msg}
+    _read_manifest.cache_clear()
 
     from rich.console import Console
 
@@ -1797,6 +2117,7 @@ def dashboard_remove_user_plugin(name: str) -> dict[str, Any]:
         }
 
     shutil.rmtree(target)
+    _read_manifest.cache_clear()
     return {"ok": True, "name": name}
 
 

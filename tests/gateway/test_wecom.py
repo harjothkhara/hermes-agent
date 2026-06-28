@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import GatewayConfig, Platform, PlatformConfig, _apply_env_overrides
 from gateway.platforms.base import SendResult
 
 
@@ -73,6 +73,38 @@ class TestWeComAdapterInit:
         assert adapter._bot_id == "env-bot"
         assert adapter._secret == "env-secret"
         assert adapter._ws_url == "wss://env.example/ws"
+
+    @pytest.mark.parametrize(
+        ("platform", "env"),
+        [
+            (Platform.WECOM, {"WECOM_BOT_ID": "bot", "WECOM_SECRET": "secret"}),
+            (
+                Platform.WECOM_CALLBACK,
+                {
+                    "WECOM_CALLBACK_CORP_ID": "corp",
+                    "WECOM_CALLBACK_CORP_SECRET": "secret",
+                },
+            ),
+        ],
+    )
+    def test_env_credentials_do_not_override_explicit_disabled(
+        self, monkeypatch, platform, env
+    ):
+        for key, value in env.items():
+            monkeypatch.setenv(key, value)
+
+        config = GatewayConfig(
+            platforms={
+                platform: PlatformConfig(
+                    enabled=False,
+                    extra={"_enabled_explicit": True},
+                )
+            }
+        )
+
+        _apply_env_overrides(config)
+
+        assert config.platforms[platform].enabled is False
 
 
 class TestWeComConnect:
@@ -467,7 +499,16 @@ class TestMediaUpload:
             await adapter._download_remote_bytes("https://example.com/file.bin", max_bytes=4)
 
     @pytest.mark.asyncio
-    async def test_cache_media_decrypts_url_payload_before_writing(self):
+    async def test_cache_media_decrypts_url_payload_before_writing(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        import gateway.platforms.base as base_module
+        monkeypatch.setattr(
+            base_module,
+            "DOCUMENT_CACHE_DIR",
+            tmp_path / "hermes" / "cache" / "documents",
+        )
         from plugins.platforms.wecom.adapter import WeComAdapter
 
         adapter = WeComAdapter(PlatformConfig(enabled=True))

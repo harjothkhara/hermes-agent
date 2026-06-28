@@ -35,6 +35,95 @@ _EXAMPLE_PLUGIN_FIXTURE = (
 )
 
 
+def test_plugins_hub_ignores_stale_disabled_for_bundled_platform(
+    tmp_path, monkeypatch, _isolate_hermes_home
+):
+    import hermes_cli.plugins_cmd as plugins_cmd
+    import hermes_cli.web_server as ws
+
+    platform_dir = tmp_path / "bundled" / "platforms" / "discord"
+    platform_dir.mkdir(parents=True)
+    (platform_dir / "plugin.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "name": "discord-platform",
+                "kind": "platform",
+                "version": "1.0.0",
+                "description": "Discord adapter",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    entry = (
+        "discord-platform",
+        "1.0.0",
+        "Discord adapter",
+        "bundled",
+        platform_dir,
+        "discord-platform",
+    )
+    monkeypatch.setattr(ws, "_get_dashboard_plugins", lambda *args, **kwargs: [])
+    monkeypatch.setattr(plugins_cmd, "_discover_all_plugins", lambda: [entry])
+    monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: set())
+    monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: {"discord-platform"})
+    monkeypatch.setattr(plugins_cmd, "_discover_memory_providers", lambda: [])
+    monkeypatch.setattr(plugins_cmd, "_discover_context_engines", lambda: [])
+
+    hub = ws._merged_plugins_hub()
+
+    assert hub["plugins"][0]["name"] == "discord-platform"
+    assert hub["plugins"][0]["key"] == "discord-platform"
+    assert hub["plugins"][0]["runtime_status"] == "enabled"
+    assert hub["plugins"][0]["runtime_toggleable"] is False
+
+
+def test_plugins_hub_marks_bundled_platform_disabled_when_channel_disabled(
+    tmp_path, monkeypatch, _isolate_hermes_home
+):
+    import hermes_cli.plugins_cmd as plugins_cmd
+    import hermes_cli.web_server as ws
+
+    platform_dir = tmp_path / "bundled" / "platforms" / "discord"
+    platform_dir.mkdir(parents=True)
+    (platform_dir / "plugin.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "name": "discord-platform",
+                "kind": "platform",
+                "version": "1.0.0",
+                "description": "Discord adapter",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    entry = (
+        "discord-platform",
+        "1.0.0",
+        "Discord adapter",
+        "bundled",
+        platform_dir,
+        "discord-platform",
+    )
+    monkeypatch.setattr(ws, "_get_dashboard_plugins", lambda *args, **kwargs: [])
+    monkeypatch.setattr(ws, "load_config", lambda: {
+        "dashboard": {"hidden_plugins": []},
+        "gateway": {"platforms": {"discord": {"enabled": False}}},
+    })
+    monkeypatch.setattr(plugins_cmd, "_discover_all_plugins", lambda: [entry])
+    monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: set())
+    monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: set())
+    monkeypatch.setattr(plugins_cmd, "_discover_memory_providers", lambda: [])
+    monkeypatch.setattr(plugins_cmd, "_discover_context_engines", lambda: [])
+
+    hub = ws._merged_plugins_hub()
+
+    assert hub["plugins"][0]["key"] == "discord-platform"
+    assert hub["plugins"][0]["runtime_status"] == "disabled"
+    assert hub["plugins"][0]["runtime_toggleable"] is False
+
+
 @pytest.fixture
 def _install_example_plugin(_isolate_hermes_home):
     """Drop the example-dashboard fixture into the per-test HERMES_HOME

@@ -13,6 +13,7 @@ This module provides:
 """
 
 import copy
+import importlib.metadata
 import json
 import logging
 import os
@@ -3002,7 +3003,7 @@ DEFAULT_CONFIG = {
 
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 31,
+    "_config_version": 32,
 }
 
 # =============================================================================
@@ -4594,6 +4595,151 @@ def check_config_version() -> Tuple[int, int]:
     return current, latest
 
 
+def _bundled_platform_disabled_aliases() -> Set[str]:
+    """Return legacy ``plugins.disabled`` spellings for bundled platforms."""
+    aliases: Set[str] = set()
+    bundled_root = os.getenv("HERMES_BUNDLED_PLUGINS")
+    if bundled_root:
+        platforms_dir = Path(bundled_root).expanduser() / "platforms"
+    else:
+        platforms_dir = Path(__file__).resolve().parent.parent / "plugins" / "platforms"
+    if not platforms_dir.is_dir():
+        return aliases
+
+    def _add_platform_key(value: Any) -> None:
+        if not isinstance(value, str) or not value.strip():
+            return
+        key = value.strip()
+        aliases.add(key)
+        aliases.add(f"platforms/{key}")
+
+    for child in platforms_dir.iterdir():
+        if not child.is_dir():
+            continue
+        manifest_file = child / "plugin.yaml"
+        if not manifest_file.exists():
+            manifest_file = child / "plugin.yml"
+        if not manifest_file.exists():
+            continue
+        try:
+            with open(manifest_file, encoding="utf-8") as _mf:
+                manifest = yaml.safe_load(_mf) or {}
+        except Exception:
+            continue
+        if manifest.get("kind") != "platform":
+            continue
+        name = manifest.get("name")
+        if isinstance(name, str) and name.strip():
+            aliases.add(name.strip())
+        _add_platform_key(child.name)
+        for scalar_key in ("id", "gateway_key", "platform_key"):
+            _add_platform_key(manifest.get(scalar_key))
+        for list_key in ("gateway_keys", "platform_keys"):
+            values = manifest.get(list_key)
+            if isinstance(values, list):
+                for value in values:
+                    _add_platform_key(value)
+    return aliases
+
+
+def _project_plugins_enabled() -> bool:
+    return os.getenv("HERMES_ENABLE_PROJECT_PLUGINS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _cleanup_stale_bundled_platform_disabled(config: Dict[str, Any]) -> int:
+    """Remove bundled platform leftovers from ``plugins.disabled`` in-place."""
+    plugins_cfg = config.get("plugins")
+    if not isinstance(plugins_cfg, dict):
+        return 0
+    disabled = plugins_cfg.get("disabled")
+    if not isinstance(disabled, list):
+        return 0
+    if not disabled:
+        return 0
+    stale_aliases = _bundled_platform_disabled_aliases()
+    if not stale_aliases:
+        return 0
+    non_bundled_plugin_aliases: Set[str] = set()
+
+    def _add_non_bundled_plugin_aliases(plugin_dir: Path, key: str) -> None:
+        init_file = plugin_dir / "__init__.py"
+        manifest_file = plugin_dir / "plugin.yaml"
+        if not manifest_file.exists():
+            manifest_file = plugin_dir / "plugin.yml"
+        if not manifest_file.exists() and not init_file.exists():
+            return
+        manifest = {}
+        if manifest_file.exists():
+            try:
+                with open(manifest_file, encoding="utf-8") as _mf:
+                    manifest = yaml.safe_load(_mf) or {}
+            except Exception:
+                manifest = {}
+        name = manifest.get("name") or plugin_dir.name
+        if isinstance(name, str) and name.strip():
+            non_bundled_plugin_aliases.add(name.strip())
+        non_bundled_plugin_aliases.add(key)
+        non_bundled_plugin_aliases.add(key.split("/")[-1])
+
+    def _scan_directory_plugins(root: Path) -> None:
+        if not root.is_dir():
+            return
+        for child in sorted(root.iterdir()):
+            if not child.is_dir():
+                continue
+            if (
+                (child / "plugin.yaml").exists()
+                or (child / "plugin.yml").exists()
+                or (child / "__init__.py").exists()
+            ):
+                _add_non_bundled_plugin_aliases(child, child.name)
+                continue
+            for grandchild in sorted(child.iterdir()):
+                if grandchild.is_dir():
+                    _add_non_bundled_plugin_aliases(
+                        grandchild,
+                        f"{child.name}/{grandchild.name}",
+                    )
+
+    _scan_directory_plugins(get_hermes_home() / "plugins")
+    if _project_plugins_enabled():
+        _scan_directory_plugins(Path.cwd() / ".hermes" / "plugins")
+
+    try:
+        eps = importlib.metadata.entry_points()
+        if hasattr(eps, "select"):
+            group_eps = eps.select(group="hermes_agent.plugins")
+        elif isinstance(eps, dict):
+            group_eps = eps.get("hermes_agent.plugins", [])
+        else:
+            group_eps = [ep for ep in eps if ep.group == "hermes_agent.plugins"]
+        for ep in group_eps:
+            if isinstance(ep.name, str) and ep.name.strip():
+                non_bundled_plugin_aliases.add(ep.name.strip())
+    except Exception:
+        pass
+
+    cleaned = [
+        item
+        for item in disabled
+        if not (
+            isinstance(item, str)
+            and item in stale_aliases
+            and item not in non_bundled_plugin_aliases
+        )
+    ]
+    removed = len(disabled) - len(cleaned)
+    if removed:
+        plugins_cfg["disabled"] = cleaned
+        config["plugins"] = plugins_cfg
+    return removed
+
+
 # =============================================================================
 # Config structure validation
 # =============================================================================
@@ -4604,7 +4750,8 @@ _KNOWN_ROOT_KEYS = {
     "fallback_providers", "credential_pool_strategies", "toolsets",
     "agent", "terminal", "display", "compression", "delegation",
     "auxiliary", "moa", "custom_providers", "context", "memory", "gateway",
-    "sessions", "streaming", "updates", "mcp_servers",
+    "sessions", "streaming", "updates", "mcp_servers", "network",
+    "platforms", "platform_toolsets", "plugins",
 }
 
 # Valid fields inside a custom_providers list entry
@@ -5364,6 +5511,27 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
                     "Set it to true to re-enable, or \"auto\" for the legacy "
                     "surface-aware behavior."
                 )
+
+    # ── Always: remove stale bundled platform entries from plugins.disabled ──
+    # Bundled platform adapters are now gateway inventory and are controlled by
+    # platforms.<name>.enabled / gateway.platforms.<name>.enabled. A stale
+    # plugins.disabled entry should neither suppress the adapter nor warn on
+    # every process launch after migration.
+    # Config version 32 records this cleanup; the cleanup itself is idempotent
+    # so hand-edited stale entries are still repaired on later startups.
+    config = read_raw_config()
+    removed_platform_disables = _cleanup_stale_bundled_platform_disabled(config)
+    if removed_platform_disables:
+        save_config(config, strip_defaults=False)
+        results["config_added"].append(
+            f"plugins.disabled cleaned {removed_platform_disables} stale bundled platform entr"
+            f"{'y' if removed_platform_disables == 1 else 'ies'}"
+        )
+        if not quiet:
+            print(
+                "  ✓ Removed stale bundled platform "
+                f"plugins.disabled entr{'y' if removed_platform_disables == 1 else 'ies'}"
+            )
 
     # ── Post-migration: disable exfiltration-shaped MCP stdio entries ──
     # Users can hand-edit mcp_servers, and older installs may already contain a
