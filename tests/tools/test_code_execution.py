@@ -18,6 +18,7 @@ import pytest
 import json
 import os
 import socket
+import tempfile
 import time
 
 os.environ["TERMINAL_ENV"] = "local"
@@ -257,6 +258,21 @@ class TestExecuteCode(unittest.TestCase):
         result = self._run('import hermes_constants; print(hermes_constants.__file__)')
         self.assertEqual(result["status"], "success")
         self.assertIn("hermes_constants.py", result["output"])
+
+    def test_linux_long_tmpdir_does_not_break_rpc_socket(self):
+        """Linux TMPDIR can be much longer than AF_UNIX socket paths allow."""
+        with tempfile.TemporaryDirectory(prefix="hermes_long_tmp_" + ("x" * 90)) as long_tmp:
+            socket_path = os.path.join(long_tmp, f"hermes_rpc_{'x' * 32}.sock")
+            self.assertGreater(len(socket_path), 108)
+
+            with patch("tools.code_execution_tool.sys.platform", "linux"), \
+                 patch("tools.code_execution_tool.tempfile.gettempdir", return_value=long_tmp), \
+                 patch("tools.code_execution_tool._load_config",
+                       return_value={"timeout": 10, "max_tool_calls": 50}):
+                result = self._run('print("long tmpdir ok")')
+
+        self.assertEqual(result["status"], "success", msg=result)
+        self.assertIn("long tmpdir ok", result["output"])
 
     def test_single_tool_call(self):
         """Script calls terminal and prints the result."""

@@ -760,6 +760,27 @@ def _env_temp_dir(env: Any) -> str:
     return "/tmp"
 
 
+def _local_rpc_socket_dir() -> str:
+    """Return a short temp dir for POSIX AF_UNIX socket paths."""
+    path_limit = 104 if sys.platform == "darwin" else 108
+    socket_name = f"hermes_rpc_{'x' * 32}.sock"
+    candidates = []
+    if sys.platform != "darwin":
+        candidates.append(tempfile.gettempdir())
+    candidates.append("/tmp")
+
+    seen = set()
+    for candidate in candidates:
+        candidate = os.path.abspath(candidate)
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        sock_path = os.path.join(candidate, socket_name)
+        if len(os.fsencode(sock_path)) < path_limit:
+            return candidate
+    return "/tmp"
+
+
 def _rpc_poll_loop(
     env,
     rpc_dir: str,
@@ -1198,9 +1219,8 @@ def execute_code(
 
     # --- Set up temp directory with hermes_tools.py and script.py ---
     tmpdir = tempfile.mkdtemp(prefix="hermes_sandbox_")
-    # Use /tmp on macOS to avoid the long /var/folders/... path that pushes
-    # Unix domain socket paths past the 104-byte macOS AF_UNIX limit.
-    # On Linux, tempfile.gettempdir() already returns /tmp.
+    # Use a short socket dir so host TMPDIR overrides cannot exceed AF_UNIX's
+    # small sun_path limit before the sandbox process even starts.
     #
     # Windows: Python 3.9+ added partial AF_UNIX support but the file-backed
     # variant is flaky across Windows builds (requires Windows 10 1803+,
@@ -1209,7 +1229,7 @@ def execute_code(
     # same ephemeral port, same 1-connection listen queue, same serialized
     # request/response framing.  The generated client reads the transport
     # selector from HERMES_RPC_SOCKET (path vs. ``tcp://host:port``).
-    _sock_tmpdir = "/tmp" if sys.platform == "darwin" else tempfile.gettempdir()
+    _sock_tmpdir = _local_rpc_socket_dir()
     _use_tcp_rpc = _IS_WINDOWS
     if _use_tcp_rpc:
         sock_path = None  # not used on Windows; TCP endpoint stored below
